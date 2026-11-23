@@ -27,6 +27,8 @@ const CHROME_DIST = path.join(EXT_DIST, "chrome");
 const FIREFOX_DIST = path.join(EXT_DIST, "firefox");
 const WEB_DIR = path.join(ROOT, "apps", "web");
 const WEB_DIST = path.join(WEB_DIR, "dist");
+const DESKTOP_DIR = path.join(ROOT, "apps", "desktop");
+const DESKTOP_DIST = path.join(DESKTOP_DIR, "dist");
 
 const EXPECTED_ZEPHYR_TARBALL =
   "https://github.com/loki-notfound/myzephyr-ts/releases/download/v2.3.0-sec.2-ts.2/loki-notfound-zephyr-ts-2.3.0-sec.2-ts.2.tgz";
@@ -125,6 +127,17 @@ function ensureBuiltDist() {
     if (!fs.existsSync(webIndex)) {
       console.log("Web PWA build output missing; running corepack pnpm build:web...");
       execFileSync("corepack", ["pnpm", "build:web"], {
+        cwd: ROOT,
+        stdio: "inherit"
+      });
+    }
+  }
+  if (fs.existsSync(path.join(DESKTOP_DIR, "package.json"))) {
+    const desktopMain = path.join(DESKTOP_DIST, "main", "main.cjs");
+    const desktopIndex = path.join(DESKTOP_DIST, "renderer", "index.html");
+    if (!fs.existsSync(desktopMain) || !fs.existsSync(desktopIndex)) {
+      console.log("Desktop build output missing; running corepack pnpm build:desktop...");
+      execFileSync("corepack", ["pnpm", "build:desktop"], {
         cwd: ROOT,
         stdio: "inherit"
       });
@@ -676,6 +689,84 @@ function auditWebDist(distDir) {
   }
 }
 
+function auditDesktopDist(distDir) {
+  if (!fs.existsSync(path.join(DESKTOP_DIR, "package.json"))) {
+    return;
+  }
+
+  const files = walkFiles(distDir);
+  if (files.length === 0) {
+    fail("desktop-dist", "apps/desktop/dist directory is empty");
+    return;
+  }
+
+  for (const file of files) {
+    if (file.endsWith(".map")) {
+      fail("no-sourcemaps", `desktop: sourcemap file found in build output: ${path.relative(ROOT, file)}`);
+    }
+  }
+
+  const mainPath = path.join(distDir, "main", "main.cjs");
+  const preloadPath = path.join(distDir, "preload", "preload.cjs");
+  const rendererDir = path.join(distDir, "renderer");
+  const assetsDir = path.join(rendererDir, "assets");
+
+  if (!fs.existsSync(mainPath)) fail("desktop-dist", "desktop: missing dist/main/main.cjs");
+  if (!fs.existsSync(preloadPath)) fail("desktop-dist", "desktop: missing dist/preload/preload.cjs");
+  if (!fs.existsSync(path.join(rendererDir, "index.html"))) {
+    fail("desktop-dist", "desktop: missing dist/renderer/index.html");
+  }
+
+  if (fs.existsSync(mainPath)) {
+    const mainCode = fs.readFileSync(mainPath, "utf8");
+    for (const reqToken of [
+      "sandbox: true",
+      "contextIsolation: true",
+      "nodeIntegration: false",
+      "setWindowOpenHandler",
+      "registerSchemesAsPrivileged"
+    ]) {
+      if (!mainCode.includes(reqToken)) {
+        fail("desktop-security", `desktop: dist/main/main.cjs missing expected guard "${reqToken}"`);
+      }
+    }
+  }
+
+  const assetEntries = fs.existsSync(assetsDir) ? fs.readdirSync(assetsDir) : [];
+  const wasmFiles = assetEntries.filter((n) => /^zephyr-[A-Za-z0-9_-]+\.wasm$/.test(n));
+  const workerFiles = assetEntries.filter((n) => /^zephyr\.worker-[A-Za-z0-9_-]+\.js$/.test(n));
+  if (wasmFiles.length !== 1) {
+    fail("desktop-wasm-bundle", `desktop: expected 1 zephyr-*.wasm, found ${wasmFiles.length}`);
+  }
+  if (workerFiles.length !== 1) {
+    fail("desktop-wasm-bundle", `desktop: expected 1 zephyr.worker-*.js, found ${workerFiles.length}`);
+  }
+
+  for (const file of walkFiles(rendererDir)) {
+    const rel = path.relative(ROOT, file);
+    const ext = path.extname(file);
+    if (ext === ".html") {
+      const html = fs.readFileSync(file, "utf8");
+      if (/<style\b/i.test(html)) fail("desktop-html-csp", `${rel}: <style> tag found`);
+      if (/\bstyle\s*=/i.test(html)) fail("desktop-html-csp", `${rel}: inline style= found`);
+      for (const ref of extractHtmlReferencedAssets(html)) {
+        if (/^(?:https?:)?\/\//i.test(ref)) {
+          fail("no-remote-assets", `${rel}: remote URL "${ref}" in built HTML`);
+        }
+      }
+    } else if (ext === ".css") {
+      const css = fs.readFileSync(file, "utf8");
+      const urlRegex = /\burl\s*\(\s*["']?([^"')\s]+)["']?\s*\)/gi;
+      let match;
+      while ((match = urlRegex.exec(css)) !== null) {
+        if (/^(?:https?:)?\/\//i.test(match[1])) {
+          fail("no-remote-assets", `${rel}: remote url("${match[1]}") in built CSS`);
+        }
+      }
+    }
+  }
+}
+
 function main() {
   runUiSafetyCheck();
   ensureBuiltDist();
@@ -684,6 +775,7 @@ function main() {
   auditBundleIsolationAndAssets("chrome", CHROME_DIST);
   auditBundleIsolationAndAssets("firefox", FIREFOX_DIST);
   auditWebDist(WEB_DIST);
+  auditDesktopDist(DESKTOP_DIST);
   auditSupplyChainLockfiles();
 
   if (failures > 0) {

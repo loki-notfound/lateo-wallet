@@ -16,6 +16,9 @@ Non-custodial TypeScript wallet for the Zephyr Protocol (`ZPH`, `ZSD`, `ZRS`,
 - `apps/web`: Installable Progressive Web App (`https://wallet.lateo.dev`,
   plain Vite build, origin IndexedDB vault, strict document & worker CSP, and
   same-origin `/rpc` proxy support).
+- `apps/desktop`: Sandboxed Electron desktop application (`app://` privileged
+  protocol, strict Page/Worker CSP, minimal `contextBridge` preload, and direct
+  daemon RPC validated via `validateNodeUrl`).
 
 ## Requirements
 
@@ -30,11 +33,13 @@ corepack pnpm typecheck
 corepack pnpm check:ui-safety
 corepack pnpm build:extension
 corepack pnpm build:web
+corepack pnpm build:desktop
 corepack pnpm check:security
 corepack pnpm test
 corepack pnpm package:extension
 corepack pnpm verify:extension
 corepack pnpm verify:web
+corepack pnpm verify:desktop
 ```
 
 Extension builds emit:

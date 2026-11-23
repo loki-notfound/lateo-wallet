@@ -1,7 +1,12 @@
 import type { ThemePreference, WalletPrefs } from "../storage/types.js";
 import type { RestoreHeightSource } from "../vault/types.js";
 
-export type HostKind = "chrome-offscreen" | "firefox-event-page" | "web-worker" | "memory";
+export type HostKind =
+  | "chrome-offscreen"
+  | "firefox-event-page"
+  | "web-worker"
+  | "electron-renderer"
+  | "memory";
 export type ZephyrNetwork = "mainnet" | "testnet" | "stagenet";
 
 export interface BalanceEntryDto {

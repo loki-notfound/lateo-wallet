@@ -18,7 +18,9 @@
     "package:extension": "node scripts/package-extension.mjs",
     "verify:extension": "node apps/extension/scripts/verify-mv3.mjs",
     "build:web": "corepack pnpm --filter @lateo-wallet/web build",
-    "verify:web": "node apps/web/scripts/verify-web.mjs"
+    "verify:web": "node apps/web/scripts/verify-web.mjs",
+    "build:desktop": "corepack pnpm --filter @lateo-wallet/desktop build",
+    "verify:desktop": "node apps/desktop/scripts/verify-desktop.mjs"
   },
   "devDependencies": {
     "playwright-core": "^1.52.0",
