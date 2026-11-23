@@ -30,6 +30,12 @@ const RULES = [
     message: "Direct HTML injection sinks are forbidden"
   },
   {
+    name: "no-inline-style-tag",
+    files: [".svelte", ".html"],
+    pattern: /<style\b/gi,
+    message: "<style> tags are forbidden; put all styles in external CSS files"
+  },
+  {
     name: "no-inline-style-attr",
     files: [".svelte", ".html"],
     pattern: /\bstyle\s*=/gi,

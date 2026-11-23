@@ -36,11 +36,14 @@ export interface EncryptedWalletBlobRecord {
   readonly updatedAt: number;
 }
 
+export type RestoreHeightSource = "daemon" | "offline-estimate" | "user";
+
 export interface WalletManifestEntry {
   readonly id: string;
   readonly name: string;
   readonly network: "mainnet" | "testnet" | "stagenet";
   readonly restoreHeight: number;
+  readonly restoreHeightSource: RestoreHeightSource;
   readonly createdAt: string;
   readonly viewOnly: boolean;
   readonly seedBackupVerified: boolean;

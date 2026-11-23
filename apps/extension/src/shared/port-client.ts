@@ -1,11 +1,15 @@
 import type {
+  CreateWalletResultDto,
   EngineEvent,
   EngineRequestPayload,
   EngineResponse,
   HostDiagnosticsDto,
+  RevealedSecretsDto,
   WalletClient,
-  WalletSnapshot
+  WalletSnapshot,
+  ZephyrNetwork
 } from "@lateo-wallet/core/rpc";
+import type { WalletPrefs } from "@lateo-wallet/core/storage";
 
 type PendingResolver = {
   readonly resolve: (value: unknown) => void;
@@ -75,17 +79,65 @@ export class PortWalletClient implements WalletClient {
     return this.request<HostDiagnosticsDto>({ type: "GET_DIAGNOSTICS" });
   }
 
-  createDisposableWallet(params: {
+  getPrefs(): Promise<WalletPrefs> {
+    return this.request<WalletPrefs>({ type: "GET_PREFS" });
+  }
+
+  updatePrefs(patch: Partial<WalletPrefs>): Promise<WalletPrefs> {
+    return this.request<WalletPrefs>({ type: "UPDATE_PREFS", patch });
+  }
+
+  createWallet(params: {
     readonly password: string;
     readonly name: string;
-    readonly network?: "mainnet" | "testnet" | "stagenet";
-  }): Promise<WalletSnapshot> {
-    return this.request<WalletSnapshot>({
-      type: "CREATE_DISPOSABLE_WALLET",
+    readonly network?: ZephyrNetwork;
+  }): Promise<CreateWalletResultDto> {
+    return this.request<CreateWalletResultDto>({
+      type: "CREATE_WALLET",
       password: params.password,
       name: params.name,
       ...(params.network ? { network: params.network } : {})
     });
+  }
+
+  restoreFromSeed(params: {
+    readonly password: string;
+    readonly name: string;
+    readonly seed: string;
+    readonly restoreHeight: number;
+    readonly network?: ZephyrNetwork;
+  }): Promise<WalletSnapshot> {
+    return this.request<WalletSnapshot>({
+      type: "RESTORE_FROM_SEED",
+      password: params.password,
+      name: params.name,
+      seed: params.seed,
+      restoreHeight: params.restoreHeight,
+      ...(params.network ? { network: params.network } : {})
+    });
+  }
+
+  restoreViewOnly(params: {
+    readonly password: string;
+    readonly name: string;
+    readonly primaryAddress: string;
+    readonly privateViewKey: string;
+    readonly restoreHeight: number;
+    readonly network?: ZephyrNetwork;
+  }): Promise<WalletSnapshot> {
+    return this.request<WalletSnapshot>({
+      type: "RESTORE_VIEW_ONLY",
+      password: params.password,
+      name: params.name,
+      primaryAddress: params.primaryAddress,
+      privateViewKey: params.privateViewKey,
+      restoreHeight: params.restoreHeight,
+      ...(params.network ? { network: params.network } : {})
+    });
+  }
+
+  markSeedBackupVerified(): Promise<WalletSnapshot> {
+    return this.request<WalletSnapshot>({ type: "MARK_SEED_BACKUP_VERIFIED" });
   }
 
   unlockWallet(password: string): Promise<WalletSnapshot> {
@@ -94,6 +146,21 @@ export class PortWalletClient implements WalletClient {
 
   lockWallet(): Promise<WalletSnapshot> {
     return this.request<WalletSnapshot>({ type: "LOCK_WALLET" });
+  }
+
+  async changeVaultPassword(params: {
+    readonly currentPassword: string;
+    readonly newPassword: string;
+  }): Promise<void> {
+    await this.request<null>({
+      type: "CHANGE_VAULT_PASSWORD",
+      currentPassword: params.currentPassword,
+      newPassword: params.newPassword
+    });
+  }
+
+  revealSecrets(password: string): Promise<RevealedSecretsDto> {
+    return this.request<RevealedSecretsDto>({ type: "REVEAL_SECRETS", password });
   }
 
   resetVault(): Promise<WalletSnapshot> {

@@ -1,4 +1,5 @@
 import type {
+  CreateWalletResultDto,
   EngineEvent,
   EngineRequest,
   EngineResponse,
@@ -19,6 +20,7 @@ const prefsStore = new ExtensionPrefsStore();
 let enginePort: chrome.runtime.Port | null = null;
 let enginePortWaiters: Array<(port: chrome.runtime.Port) => void> = [];
 let creatingOffscreen: Promise<void> | null = null;
+let walletUnlocked = false;
 
 const pendingEngineCalls = new Map<
   string,
@@ -62,6 +64,7 @@ async function ensureOffscreenEnginePort(): Promise<chrome.runtime.Port> {
 }
 
 async function closeOffscreenDocument(): Promise<void> {
+  walletUnlocked = false;
   if (enginePort) {
     try {
       enginePort.disconnect();
@@ -141,13 +144,27 @@ async function handleUiRequest(req: EngineRequest): Promise<EngineResponse> {
       return { id: req.id, ok: true, result: await getDiagnostics() };
     }
 
+    if (req.type === "GET_PREFS") {
+      return { id: req.id, ok: true, result: await prefsStore.readPrefs() };
+    }
+
+    if (req.type === "UPDATE_PREFS") {
+      const updated = await prefsStore.writePrefs(req.patch);
+      if (walletUnlocked && req.patch.autoLockMinutes !== undefined) {
+        await resetAutoLockAlarm();
+      }
+      return { id: req.id, ok: true, result: updated };
+    }
+
     if (req.type === "GET_SNAPSHOT") {
       if (!(await hasOffscreenDocument())) {
+        walletUnlocked = false;
         return { id: req.id, ok: true, result: await buildLockedSnapshot() };
       }
       const res = await forwardToEngine(req);
       if (res.ok) {
         const snap = { ...(res.result as WalletSnapshot), offscreenActive: true };
+        walletUnlocked = !snap.locked;
         return { id: req.id, ok: true, result: snap };
       }
       return res;
@@ -177,16 +194,59 @@ async function handleUiRequest(req: EngineRequest): Promise<EngineResponse> {
       return { id: req.id, ok: true, result: emptySnap };
     }
 
-    // CREATE_DISPOSABLE_WALLET or UNLOCK_WALLET
-    const res = await forwardToEngine(req);
-    if (res.ok) {
-      await resetAutoLockAlarm();
-      const snap = { ...(res.result as WalletSnapshot), offscreenActive: true };
-      broadcastEvent({ type: "SNAPSHOT_UPDATED", snapshot: snap });
-      return { id: req.id, ok: true, result: snap };
+    // Operations that require an unlocked session
+    if (
+      req.type === "MARK_SEED_BACKUP_VERIFIED" ||
+      req.type === "CHANGE_VAULT_PASSWORD" ||
+      req.type === "REVEAL_SECRETS"
+    ) {
+      if (!(await hasOffscreenDocument())) {
+        return {
+          id: req.id,
+          ok: false,
+          error: { code: "LOCKED", message: "Wallet must be unlocked" }
+        };
+      }
+      const res = await forwardToEngine(req);
+      if (res.ok) {
+        await resetAutoLockAlarm();
+        if (req.type === "MARK_SEED_BACKUP_VERIFIED") {
+          const snap = { ...(res.result as WalletSnapshot), offscreenActive: true };
+          broadcastEvent({ type: "SNAPSHOT_UPDATED", snapshot: snap });
+          return { id: req.id, ok: true, result: snap };
+        }
+      }
+      return res;
     }
-    return res;
+
+    // CREATE_WALLET, RESTORE_FROM_SEED, RESTORE_VIEW_ONLY, UNLOCK_WALLET
+    const wasUnlocked = walletUnlocked;
+    const res = await forwardToEngine(req);
+    if (!res.ok) {
+      // Tear down idle Offscreen Document immediately if create/restore/unlock failed
+      if (!wasUnlocked) {
+        await closeOffscreenDocument();
+      }
+      return res;
+    }
+
+    walletUnlocked = true;
+    await resetAutoLockAlarm();
+
+    if (req.type === "CREATE_WALLET") {
+      const created = res.result as CreateWalletResultDto;
+      const snap: WalletSnapshot = { ...created.snapshot, offscreenActive: true };
+      broadcastEvent({ type: "SNAPSHOT_UPDATED", snapshot: snap });
+      return { id: req.id, ok: true, result: { ...created, snapshot: snap } };
+    }
+
+    const snap: WalletSnapshot = { ...(res.result as WalletSnapshot), offscreenActive: true };
+    broadcastEvent({ type: "SNAPSHOT_UPDATED", snapshot: snap });
+    return { id: req.id, ok: true, result: snap };
   } catch (err) {
+    if (!walletUnlocked) {
+      await closeOffscreenDocument().catch(() => {});
+    }
     return {
       id: req.id,
       ok: false,
@@ -199,7 +259,21 @@ async function handleUiRequest(req: EngineRequest): Promise<EngineResponse> {
 }
 
 chrome.runtime.onConnect.addListener((port) => {
+  // Defense-in-depth sender validation: only accept ports from this extension
+  if (port.sender?.id !== chrome.runtime.id) {
+    port.disconnect();
+    return;
+  }
+
+  const extOriginPrefix = chrome.runtime.getURL("");
+  const offscreenUrl = chrome.runtime.getURL(OFFSCREEN_URL);
+
   if (port.name === "lateo-engine") {
+    if (port.sender.url !== offscreenUrl) {
+      port.disconnect();
+      return;
+    }
+
     enginePort = port;
     for (const waiter of enginePortWaiters) {
       waiter(port);
@@ -210,6 +284,7 @@ chrome.runtime.onConnect.addListener((port) => {
       if (!msg || typeof msg !== "object") return;
       if ("type" in msg && (msg as EngineEvent).type === "SNAPSHOT_UPDATED") {
         const ev = msg as EngineEvent;
+        walletUnlocked = !ev.snapshot.locked;
         broadcastEvent({
           type: "SNAPSHOT_UPDATED",
           snapshot: { ...ev.snapshot, offscreenActive: true }
@@ -228,6 +303,7 @@ chrome.runtime.onConnect.addListener((port) => {
 
     port.onDisconnect.addListener(() => {
       if (enginePort === port) enginePort = null;
+      walletUnlocked = false;
       for (const [, pending] of pendingEngineCalls) {
         pending.reject(new Error("Offscreen engine disconnected"));
       }
@@ -237,6 +313,11 @@ chrome.runtime.onConnect.addListener((port) => {
   }
 
   if (port.name === "lateo-ui") {
+    if (!port.sender.url || !port.sender.url.startsWith(extOriginPrefix)) {
+      port.disconnect();
+      return;
+    }
+
     uiPorts.add(port);
     port.onMessage.addListener((msg: unknown) => {
       if (!msg || typeof msg !== "object" || !("type" in msg) || !("id" in msg)) return;
@@ -251,7 +332,10 @@ chrome.runtime.onConnect.addListener((port) => {
     port.onDisconnect.addListener(() => {
       uiPorts.delete(port);
     });
+    return;
   }
+
+  port.disconnect();
 });
 
 chrome.alarms.onAlarm.addListener((alarm) => {

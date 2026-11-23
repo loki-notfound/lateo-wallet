@@ -1,12 +1,15 @@
 import { describe, expect, it } from "vitest";
 import {
+  VaultAuthError,
   decryptVaultMeta,
   decryptWalletBlob,
   encryptVaultMeta,
   encryptWalletBlob,
+  fromBase64,
   generateCorePassword,
   generateDek,
   generateWalletId,
+  toBase64,
   zeroize
 } from "./crypto.js";
 import { VAULT_SCHEMA_VERSION, type VaultManifestPlaintext } from "./types.js";
@@ -29,11 +32,12 @@ describe("vault WebCrypto envelope (KEK -> vault_meta[DEK + corePassword] -> wal
           name: "Test Wallet",
           network: "mainnet",
           restoreHeight: 0,
+          restoreHeightSource: "offline-estimate",
           createdAt: "2026-11-22T00:00:00Z",
           viewOnly: false,
           seedBackupVerified: false,
           corePassword,
-          primaryAddress: "ZEPHs0000EXAMPLE"
+          primaryAddress: "ZEPHYR0000EXAMPLE"
         }
       ]
     };
@@ -54,14 +58,31 @@ describe("vault WebCrypto envelope (KEK -> vault_meta[DEK + corePassword] -> wal
     expect(await decryptWalletBlob(unlocked.dekKey, encKeys)).toEqual(keysBytes);
     expect(await decryptWalletBlob(unlocked.dekKey, encCache)).toEqual(cacheBytes);
 
-    // Reject wrong vault password
-    await expect(decryptVaultMeta(record, "wrong-password")).rejects.toThrow();
+    // Reject wrong vault password with sanitized VaultAuthError
+    await expect(decryptVaultMeta(record, "wrong-password")).rejects.toBeInstanceOf(VaultAuthError);
+
+    // Reject tampered vault_meta ciphertext
+    const rawMetaCt = fromBase64(record.ciphertext);
+    rawMetaCt[0] = (rawMetaCt[0] ?? 0) ^ 0xff;
+    await expect(
+      decryptVaultMeta(
+        { ...record, ciphertext: toBase64(rawMetaCt) },
+        "correct-horse-battery-staple"
+      )
+    ).rejects.toBeInstanceOf(VaultAuthError);
 
     // Reject swapped blob kind (AAD mismatch)
     const swapped = { ...encKeys, kind: "cache" as const, key: `${walletId}:cache` as const };
     await expect(decryptWalletBlob(unlocked.dekKey, swapped)).rejects.toThrow();
 
-    // Reject tampered ciphertext
+    // Reject swapped walletId (AAD mismatch)
+    const wrongWallet = {
+      ...encKeys,
+      walletId: generateWalletId()
+    };
+    await expect(decryptWalletBlob(unlocked.dekKey, wrongWallet)).rejects.toThrow();
+
+    // Reject tampered blob ciphertext
     const tamperedBytes = new Uint8Array(encKeys.ciphertext);
     tamperedBytes[0] = (tamperedBytes[0] ?? 0) ^ 0xff;
     await expect(
@@ -69,7 +90,7 @@ describe("vault WebCrypto envelope (KEK -> vault_meta[DEK + corePassword] -> wal
     ).rejects.toThrow();
   });
 
-  it("rotates vault password atomically without touching encrypted wallet blobs", async () => {
+  it("rotates vault password atomically with fresh salt and IV without touching wallet blobs", async () => {
     const { dekKey, dekBase64 } = await generateDek();
     const walletId = generateWalletId();
     const manifest: VaultManifestPlaintext = {
@@ -87,7 +108,12 @@ describe("vault WebCrypto envelope (KEK -> vault_meta[DEK + corePassword] -> wal
       iterations: FAST_TEST_ITERATIONS
     });
 
-    await expect(decryptVaultMeta(rotated.record, "old-password")).rejects.toThrow();
+    expect(rotated.record.kdf.salt).not.toBe(first.record.kdf.salt);
+    expect(rotated.record.iv).not.toBe(first.record.iv);
+
+    await expect(decryptVaultMeta(rotated.record, "old-password")).rejects.toBeInstanceOf(
+      VaultAuthError
+    );
     const unlockedNew = await decryptVaultMeta(rotated.record, "new-password");
     expect(await decryptWalletBlob(unlockedNew.dekKey, blob)).toEqual(new Uint8Array([42, 43]));
   });

@@ -3,6 +3,7 @@ import {
   VAULT_SCHEMA_VERSION,
   type EncryptedVaultMetaRecord,
   type EncryptedWalletBlobRecord,
+  type KdfDescriptor,
   type VaultManifestPlaintext,
   type WalletBlobKind
 } from "./types.js";
@@ -11,6 +12,15 @@ const TEXT_ENCODER = new TextEncoder();
 const TEXT_DECODER = new TextDecoder();
 
 const META_AAD = TEXT_ENCODER.encode(`lateo-vault:v${VAULT_SCHEMA_VERSION}:meta`);
+
+export class VaultAuthError extends Error {
+  readonly code = "INVALID_PASSWORD" as const;
+
+  constructor(message = "Incorrect vault password") {
+    super(message);
+    this.name = "VaultAuthError";
+  }
+}
 
 function blobAad(walletId: string, kind: WalletBlobKind): Uint8Array<ArrayBuffer> {
   return new Uint8Array(
@@ -132,15 +142,12 @@ export async function importDek(raw: Uint8Array<ArrayBuffer>): Promise<CryptoKey
   ]);
 }
 
-export async function encryptVaultMeta(
+export async function encryptVaultMetaWithKek(
   manifest: VaultManifestPlaintext,
-  password: string,
-  options?: { readonly iterations?: number }
-): Promise<{ readonly record: EncryptedVaultMetaRecord; readonly kek: CryptoKey }> {
-  const iterations = options?.iterations ?? DEFAULT_PBKDF2_ITERATIONS;
-  const salt = randomBytes(16);
+  kek: CryptoKey,
+  kdf: KdfDescriptor
+): Promise<EncryptedVaultMetaRecord> {
   const iv = randomBytes(12);
-  const kek = await deriveKek(password, salt, iterations);
   const plaintext = toArrayBufferCopy(TEXT_ENCODER.encode(JSON.stringify(manifest)));
   try {
     const encrypted = await getSubtle().encrypt(
@@ -148,22 +155,38 @@ export async function encryptVaultMeta(
       kek,
       plaintext
     );
-    const record: EncryptedVaultMetaRecord = {
+    return {
       id: "primary",
       schemaVersion: VAULT_SCHEMA_VERSION,
-      kdf: {
-        alg: "PBKDF2-SHA256",
-        iterations,
-        salt: toBase64(salt)
-      },
+      kdf,
       iv: toBase64(iv),
       ciphertext: toBase64(new Uint8Array(encrypted)),
       updatedAt: Date.now()
     };
-    return { record, kek };
   } finally {
     zeroize(plaintext);
   }
+}
+
+export async function encryptVaultMeta(
+  manifest: VaultManifestPlaintext,
+  password: string,
+  options?: { readonly iterations?: number }
+): Promise<{
+  readonly record: EncryptedVaultMetaRecord;
+  readonly kek: CryptoKey;
+  readonly kdf: KdfDescriptor;
+}> {
+  const iterations = options?.iterations ?? DEFAULT_PBKDF2_ITERATIONS;
+  const salt = randomBytes(16);
+  const kdf: KdfDescriptor = {
+    alg: "PBKDF2-SHA256",
+    iterations,
+    salt: toBase64(salt)
+  };
+  const kek = await deriveKek(password, salt, iterations);
+  const record = await encryptVaultMetaWithKek(manifest, kek, kdf);
+  return { record, kek, kdf };
 }
 
 export async function decryptVaultMeta(
@@ -172,6 +195,7 @@ export async function decryptVaultMeta(
 ): Promise<{
   readonly manifest: VaultManifestPlaintext;
   readonly kek: CryptoKey;
+  readonly kdf: KdfDescriptor;
   readonly dekKey: CryptoKey;
 }> {
   if (record.schemaVersion !== VAULT_SCHEMA_VERSION) {
@@ -185,11 +209,17 @@ export async function decryptVaultMeta(
   const ciphertext = fromBase64(record.ciphertext);
   const kek = await deriveKek(password, salt, record.kdf.iterations);
 
-  const decryptedBuffer = await getSubtle().decrypt(
-    { name: "AES-GCM", iv, additionalData: META_AAD },
-    kek,
-    ciphertext
-  );
+  let decryptedBuffer: ArrayBuffer;
+  try {
+    decryptedBuffer = await getSubtle().decrypt(
+      { name: "AES-GCM", iv, additionalData: META_AAD },
+      kek,
+      ciphertext
+    );
+  } catch {
+    throw new VaultAuthError();
+  }
+
   const plaintextBytes = new Uint8Array(decryptedBuffer);
   try {
     const parsed = JSON.parse(TEXT_DECODER.decode(plaintextBytes)) as VaultManifestPlaintext;
@@ -203,7 +233,7 @@ export async function decryptVaultMeta(
     const rawDek = fromBase64(parsed.dek);
     try {
       const dekKey = await importDek(rawDek);
-      return { manifest: parsed, kek, dekKey };
+      return { manifest: parsed, kek, kdf: record.kdf, dekKey };
     } finally {
       zeroize(rawDek);
     }

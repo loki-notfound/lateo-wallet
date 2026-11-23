@@ -27,6 +27,10 @@ function openDb(): Promise<IDBDatabase> {
   });
 }
 
+/**
+ * Execute an IndexedDB request and resolve ONLY when the transaction commits
+ * (`tx.oncomplete`) so readwrite operations are durable before returning.
+ */
 function runTx<T>(
   storeName: string,
   mode: IDBTransactionMode,
@@ -35,16 +39,30 @@ function runTx<T>(
   return openDb().then(
     (db) =>
       new Promise<T>((resolve, reject) => {
+        let result: T | undefined;
+        let settled = false;
+        const fail = (err: unknown): void => {
+          if (settled) return;
+          settled = true;
+          db.close();
+          reject(err instanceof Error ? err : new Error("IndexedDB transaction failed"));
+        };
+
         const tx = db.transaction(storeName, mode);
         const store = tx.objectStore(storeName);
         const req = fn(store);
-        req.onsuccess = () => resolve(req.result);
-        req.onerror = () => reject(req.error ?? new Error("IndexedDB request failed"));
-        tx.oncomplete = () => db.close();
-        tx.onabort = () => {
-          db.close();
-          reject(tx.error ?? new Error("IndexedDB transaction aborted"));
+        req.onsuccess = () => {
+          result = req.result;
         };
+        req.onerror = () => fail(req.error ?? new Error("IndexedDB request failed"));
+        tx.oncomplete = () => {
+          if (settled) return;
+          settled = true;
+          db.close();
+          resolve(result as T);
+        };
+        tx.onabort = () => fail(tx.error ?? new Error("IndexedDB transaction aborted"));
+        tx.onerror = () => fail(tx.error ?? new Error("IndexedDB transaction error"));
       })
   );
 }
@@ -73,13 +91,90 @@ export class IndexedDbVaultStore implements VaultBlobStore {
     await runTx(STORE_BLOBS, "readwrite", (s) => s.put(record));
   }
 
+  async writeVaultAtomic(
+    meta: EncryptedVaultMetaRecord,
+    blobs: readonly EncryptedWalletBlobRecord[]
+  ): Promise<void> {
+    const db = await openDb();
+    return new Promise<void>((resolve, reject) => {
+      let settled = false;
+      const fail = (err: unknown): void => {
+        if (settled) return;
+        settled = true;
+        db.close();
+        reject(err instanceof Error ? err : new Error("Atomic vault write failed"));
+      };
+
+      const tx = db.transaction([STORE_BLOBS, STORE_META], "readwrite");
+      const blobStore = tx.objectStore(STORE_BLOBS);
+      const metaStore = tx.objectStore(STORE_META);
+
+      for (const blob of blobs) {
+        blobStore.put(blob);
+      }
+      metaStore.put(meta);
+
+      tx.oncomplete = () => {
+        if (settled) return;
+        settled = true;
+        db.close();
+        resolve();
+      };
+      tx.onabort = () => fail(tx.error ?? new Error("Atomic vault transaction aborted"));
+      tx.onerror = () => fail(tx.error ?? new Error("Atomic vault transaction error"));
+    });
+  }
+
   async deleteWalletBlobs(walletId: string): Promise<void> {
-    await runTx(STORE_BLOBS, "readwrite", (s) => s.delete(`${walletId}:keys`));
-    await runTx(STORE_BLOBS, "readwrite", (s) => s.delete(`${walletId}:cache`));
+    const db = await openDb();
+    return new Promise<void>((resolve, reject) => {
+      let settled = false;
+      const fail = (err: unknown): void => {
+        if (settled) return;
+        settled = true;
+        db.close();
+        reject(err instanceof Error ? err : new Error("Delete wallet blobs failed"));
+      };
+
+      const tx = db.transaction(STORE_BLOBS, "readwrite");
+      const store = tx.objectStore(STORE_BLOBS);
+      store.delete(`${walletId}:keys`);
+      store.delete(`${walletId}:cache`);
+
+      tx.oncomplete = () => {
+        if (settled) return;
+        settled = true;
+        db.close();
+        resolve();
+      };
+      tx.onabort = () => fail(tx.error ?? new Error("Delete blobs transaction aborted"));
+      tx.onerror = () => fail(tx.error ?? new Error("Delete blobs transaction error"));
+    });
   }
 
   async clearAll(): Promise<void> {
-    await runTx(STORE_META, "readwrite", (s) => s.clear());
-    await runTx(STORE_BLOBS, "readwrite", (s) => s.clear());
+    const db = await openDb();
+    return new Promise<void>((resolve, reject) => {
+      let settled = false;
+      const fail = (err: unknown): void => {
+        if (settled) return;
+        settled = true;
+        db.close();
+        reject(err instanceof Error ? err : new Error("Clear vault failed"));
+      };
+
+      const tx = db.transaction([STORE_META, STORE_BLOBS], "readwrite");
+      tx.objectStore(STORE_META).clear();
+      tx.objectStore(STORE_BLOBS).clear();
+
+      tx.oncomplete = () => {
+        if (settled) return;
+        settled = true;
+        db.close();
+        resolve();
+      };
+      tx.onabort = () => fail(tx.error ?? new Error("Clear vault transaction aborted"));
+      tx.onerror = () => fail(tx.error ?? new Error("Clear vault transaction error"));
+    });
   }
 }

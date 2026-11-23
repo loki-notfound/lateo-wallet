@@ -1,4 +1,5 @@
 import type {
+  CreateWalletResultDto,
   EngineEvent,
   EngineRequest,
   EngineResponse,
@@ -118,26 +119,63 @@ async function handleRequest(req: EngineRequest): Promise<EngineResponse> {
     return { id: req.id, ok: true, result: await getDiagnostics() };
   }
 
-  const res = await host.handleRequest(req);
-  if (res.ok) {
-    const snap = res.result as WalletSnapshot;
-    walletUnlocked = !snap.locked;
-    if (walletUnlocked) {
-      await resetAutoLockAlarm();
-    } else {
-      await clearAutoLockAlarm();
-    }
-    updateKeepAlive(walletUnlocked || host.isBusy());
-    const enriched: WalletSnapshot = { ...snap, keepAliveActive: isKeepAliveActive() };
-    if (req.type !== "GET_SNAPSHOT") {
-      broadcastEvent({ type: "SNAPSHOT_UPDATED", snapshot: enriched });
-    }
-    return { id: req.id, ok: true, result: enriched };
+  if (req.type === "GET_PREFS") {
+    return { id: req.id, ok: true, result: await prefsStore.readPrefs() };
   }
-  return res;
+
+  if (req.type === "UPDATE_PREFS") {
+    const updated = await prefsStore.writePrefs(req.patch);
+    if (walletUnlocked && req.patch.autoLockMinutes !== undefined) {
+      await resetAutoLockAlarm();
+    }
+    return { id: req.id, ok: true, result: updated };
+  }
+
+  const res = await host.handleRequest(req);
+  if (!res.ok) return res;
+
+  if (req.type === "CHANGE_VAULT_PASSWORD" || req.type === "REVEAL_SECRETS") {
+    if (walletUnlocked) await resetAutoLockAlarm();
+    return res;
+  }
+
+  if (req.type === "CREATE_WALLET") {
+    const created = res.result as CreateWalletResultDto;
+    walletUnlocked = !created.snapshot.locked;
+    if (walletUnlocked) await resetAutoLockAlarm();
+    updateKeepAlive(walletUnlocked || host.isBusy());
+    const enrichedSnap: WalletSnapshot = {
+      ...created.snapshot,
+      keepAliveActive: isKeepAliveActive()
+    };
+    broadcastEvent({ type: "SNAPSHOT_UPDATED", snapshot: enrichedSnap });
+    return { id: req.id, ok: true, result: { ...created, snapshot: enrichedSnap } };
+  }
+
+  const snap = res.result as WalletSnapshot;
+  walletUnlocked = !snap.locked;
+  if (walletUnlocked) {
+    await resetAutoLockAlarm();
+  } else {
+    await clearAutoLockAlarm();
+  }
+  updateKeepAlive(walletUnlocked || host.isBusy());
+  const enriched: WalletSnapshot = { ...snap, keepAliveActive: isKeepAliveActive() };
+  if (req.type !== "GET_SNAPSHOT") {
+    broadcastEvent({ type: "SNAPSHOT_UPDATED", snapshot: enriched });
+  }
+  return { id: req.id, ok: true, result: enriched };
 }
 
 chrome.runtime.onConnect.addListener((port) => {
+  // Defense-in-depth sender validation: only accept ports from this extension
+  if (port.sender?.id !== chrome.runtime.id) {
+    port.disconnect();
+    return;
+  }
+
+  const extOriginPrefix = chrome.runtime.getURL("");
+
   if (port.name === "lateo-firefox-keepalive") {
     port.onMessage.addListener(() => {
       // Keep-alive heartbeat acknowledged
@@ -146,6 +184,11 @@ chrome.runtime.onConnect.addListener((port) => {
   }
 
   if (port.name === "lateo-ui") {
+    if (!port.sender.url || !port.sender.url.startsWith(extOriginPrefix)) {
+      port.disconnect();
+      return;
+    }
+
     uiPorts.add(port);
     port.onMessage.addListener((msg: unknown) => {
       if (!msg || typeof msg !== "object" || !("type" in msg) || !("id" in msg)) return;
@@ -161,7 +204,10 @@ chrome.runtime.onConnect.addListener((port) => {
       uiPorts.delete(port);
       updateKeepAlive(walletUnlocked || host.isBusy());
     });
+    return;
   }
+
+  port.disconnect();
 });
 
 chrome.alarms.onAlarm.addListener((alarm) => {

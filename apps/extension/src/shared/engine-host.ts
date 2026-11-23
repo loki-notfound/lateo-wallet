@@ -1,4 +1,5 @@
 import {
+  VaultAuthError,
   WalletEngine,
   type EngineRequest,
   type EngineResponse,
@@ -51,14 +52,43 @@ export class ExtensionEngineHost {
           const result = await this.engine.getSnapshot();
           return { id: req.id, ok: true, result };
         }
-        case "CREATE_DISPOSABLE_WALLET": {
+        case "CREATE_WALLET": {
           const result = await this.trackOp(() =>
-            this.engine.createDisposableWallet({
+            this.engine.createWallet({
               password: req.password,
               name: req.name,
               ...(req.network ? { network: req.network } : {})
             })
           );
+          return { id: req.id, ok: true, result };
+        }
+        case "RESTORE_FROM_SEED": {
+          const result = await this.trackOp(() =>
+            this.engine.restoreFromSeed({
+              password: req.password,
+              name: req.name,
+              seed: req.seed,
+              restoreHeight: req.restoreHeight,
+              ...(req.network ? { network: req.network } : {})
+            })
+          );
+          return { id: req.id, ok: true, result };
+        }
+        case "RESTORE_VIEW_ONLY": {
+          const result = await this.trackOp(() =>
+            this.engine.restoreViewOnly({
+              password: req.password,
+              name: req.name,
+              primaryAddress: req.primaryAddress,
+              privateViewKey: req.privateViewKey,
+              restoreHeight: req.restoreHeight,
+              ...(req.network ? { network: req.network } : {})
+            })
+          );
+          return { id: req.id, ok: true, result };
+        }
+        case "MARK_SEED_BACKUP_VERIFIED": {
+          const result = await this.trackOp(() => this.engine.markSeedBackupVerified());
           return { id: req.id, ok: true, result };
         }
         case "UNLOCK_WALLET": {
@@ -69,22 +99,47 @@ export class ExtensionEngineHost {
           const result = await this.trackOp(() => this.engine.lockWallet());
           return { id: req.id, ok: true, result };
         }
+        case "CHANGE_VAULT_PASSWORD": {
+          await this.trackOp(() =>
+            this.engine.changeVaultPassword({
+              currentPassword: req.currentPassword,
+              newPassword: req.newPassword
+            })
+          );
+          return { id: req.id, ok: true, result: null };
+        }
+        case "REVEAL_SECRETS": {
+          const result = await this.trackOp(() => this.engine.revealSecrets(req.password));
+          return { id: req.id, ok: true, result };
+        }
         case "RESET_VAULT": {
           const result = await this.trackOp(() => this.engine.resetVault());
           return { id: req.id, ok: true, result };
         }
-        case "GET_DIAGNOSTICS": {
+        case "GET_DIAGNOSTICS":
+        case "GET_PREFS":
+        case "UPDATE_PREFS": {
           return {
             id: req.id,
             ok: false,
             error: {
-              code: "UNHANDLED_DIAGNOSTICS",
-              message: "Diagnostics are served by the browser background host"
+              code: "UNHANDLED_HOST_CALL",
+              message: "Request must be served by the browser background host"
             }
           };
         }
       }
     } catch (err) {
+      if (err instanceof VaultAuthError) {
+        return {
+          id: req.id,
+          ok: false,
+          error: {
+            code: err.code,
+            message: "Incorrect vault password"
+          }
+        };
+      }
       return {
         id: req.id,
         ok: false,
