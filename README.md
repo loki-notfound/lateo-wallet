@@ -22,7 +22,7 @@ Non-custodial TypeScript wallet for the Zephyr Protocol (`ZPH`, `ZSD`, `ZRS`,
 
 ## Requirements
 
-- Node.js `>=22`
+- Node.js `>=24`
 - `pnpm` (managed via `corepack`)
 
 ## Development commands

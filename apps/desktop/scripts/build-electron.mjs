@@ -11,7 +11,7 @@ async function main() {
       outfile: path.join(ROOT, "dist/main/main.cjs"),
       bundle: true,
       platform: "node",
-      target: "node22",
+      target: "node24",
       format: "cjs",
       sourcemap: false,
       external: ["electron"]
@@ -21,7 +21,7 @@ async function main() {
       outfile: path.join(ROOT, "dist/preload/preload.cjs"),
       bundle: true,
       platform: "node",
-      target: "node22",
+      target: "node24",
       format: "cjs",
       sourcemap: false,
       external: ["electron"]

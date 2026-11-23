@@ -17,7 +17,7 @@
   },
   "devDependencies": {
     "@sveltejs/vite-plugin-svelte": "^6.0.0",
-    "@types/node": "^22.15.0",
+    "@types/node": "^24",
     "electron": "45.2.1",
     "esbuild": "^0.25.0",
     "typescript": "^5.8.3",
