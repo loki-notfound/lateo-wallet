@@ -1,10 +1,12 @@
 #!/usr/bin/env node
 /**
- * Automated M1.3 MV3 end-to-end verification harness for Chromium and Firefox.
- * Uses fresh, random, empty disposable wallets only (zero real funds).
+ * Automated M1.4 MV3 end-to-end verification harness for Chromium and Firefox.
+ * Uses fresh, random, empty disposable wallets only (zero real funds, zero real broadcasts).
  * Covers:
  * - Onboarding (Create + live daemon restoreHeight + blank print sheet + 3-word quiz)
  * - Live read-only sync against https://node.lateo.dev (4 V2 asset cards, reserve ratio & oracle banner)
+ * - Send & Sweep flows (V2 asset selector, Standard vs Max/Sweep toggle, invalid-address & zero-balance rejections)
+ * - Convert flows (all 6 V2 pairs, live reserve-ratio gating banner with open/blocked pairs, >4-decimal rejection, oracle output estimate)
  * - Receive view (create & rename subaddress + pure-SVG dark-on-white QR code)
  * - Transaction History view + opt-in refreshPool()
  * - Node Switcher live probe against https://node.lateo.dev
@@ -200,6 +202,71 @@ async function verifyChrome() {
     assert(syncedHeight > 100_000, `Expected synced height > 100000, got "${syncedHeightText}"`);
     const reserveRatioText = (await tab.textContent('[data-testid="reserve-ratio-value"]'))?.trim();
 
+    // 2b. Send & Sweep view (M1.4): verify validation rejections and Sweep mode on disposable empty wallet
+    await tab.click('[data-testid="tab-send"]');
+    await tab.waitForSelector('[data-testid="send-view"]', { timeout: 10_000 });
+    await tab.fill('[data-testid="send-address-input-0"]', "ZEPHYRinvalidchecksum");
+    await tab.fill('[data-testid="send-amount-input-0"]', "1.25");
+    await tab.click('[data-testid="prepare-send-btn"]');
+    await tab.waitForSelector('[data-testid="send-error-banner"]', { timeout: 15_000 });
+    const badAddrErr = (await tab.textContent('[data-testid="send-error-banner"]')) ?? "";
+    assert(
+      badAddrErr.includes("not a valid Zephyr mainnet address"),
+      `Expected invalid address rejection, got "${badAddrErr}"`
+    );
+
+    await tab.fill('[data-testid="send-address-input-0"]', createdAddr);
+    await tab.fill('[data-testid="send-amount-input-0"]', "1.250000000000");
+    await tab.click('[data-testid="prepare-send-btn"]');
+    await tab.waitForFunction(
+      () =>
+        document
+          .querySelector('[data-testid="send-error-banner"]')
+          ?.textContent?.includes("Not enough unlocked ZPH"),
+      null,
+      { timeout: 15_000 }
+    );
+
+    await tab.click('[data-testid="send-mode-sweep"]');
+    await tab.waitForSelector('[data-testid="sweep-mode-explainer"]', { timeout: 5_000 });
+    await tab.fill('[data-testid="sweep-address-input"]', createdAddr);
+    await tab.click('[data-testid="prepare-send-btn"]');
+    await tab.waitForFunction(
+      () =>
+        document
+          .querySelector('[data-testid="send-error-banner"]')
+          ?.textContent?.includes("No unlocked ZPH available to sweep"),
+      null,
+      { timeout: 15_000 }
+    );
+    await assertGuards(tab, "chrome-send");
+
+    // 2c. Convert view (M1.4): verify all 6 V2 pairs, live reserve gating banner, >4 decimal rejection, and oracle estimate
+    await tab.click('[data-testid="tab-convert"]');
+    await tab.waitForSelector('[data-testid="convert-view"]', { timeout: 10_000 });
+    await tab.waitForSelector('[data-testid="convert-reserve-gate-banner"]', { timeout: 10_000 });
+    for (const pairId of ["ZPH-ZSD", "ZSD-ZPH", "ZPH-ZRS", "ZRS-ZPH", "ZSD-ZYS", "ZYS-ZSD"]) {
+      await tab.waitForSelector(`[data-testid="convert-pair-${pairId}"]`, { timeout: 5_000 });
+    }
+    await tab.click('[data-testid="convert-pair-ZPH-ZRS"]');
+    await tab.fill('[data-testid="convert-amount-input"]', "1.12345");
+    await tab.waitForSelector('[data-testid="convert-amount-error"]', { timeout: 5_000 });
+    const convDecErr = (await tab.textContent('[data-testid="convert-amount-error"]')) ?? "";
+    assert(
+      convDecErr.includes("at most 4 decimal places"),
+      `Expected >4 decimal conversion error, got "${convDecErr}"`
+    );
+    await tab.fill('[data-testid="convert-amount-input"]', "10.2500");
+    await tab.waitForFunction(
+      () =>
+        document
+          .querySelector('[data-testid="convert-estimated-output"]')
+          ?.textContent?.includes("ZRS"),
+      null,
+      { timeout: 5_000 }
+    );
+    await assertGuards(tab, "chrome-convert");
+
     // 3. Receive view: create & rename subaddress + verify pure-SVG QR code
     await tab.click('[data-testid="tab-receive"]');
     await tab.waitForSelector('[data-testid="receive-view"]', { timeout: 10_000 });
@@ -315,6 +382,8 @@ async function verifyChrome() {
       syncedHeight,
       reopenedCheckpointHeight: reopenedHeight,
       reserveRatioText,
+      sendAndSweepVerified: true,
+      convertAndReserveGateVerified: true,
       subaddressPersistedAcrossLock: true,
       refreshPoolVerified: true,
       nodeProbeVerified: true,
@@ -567,6 +636,40 @@ async function verifyFirefox() {
     assert(syncedHeight > 100_000, `Firefox expected synced height > 100000, got ${syncedHeight}`);
     const reserveRatioText = (await wdText(base, sessionId, '[data-testid="reserve-ratio-value"]')).trim();
 
+    // 2b. Send & Convert views in Firefox (M1.4): verify validation rejections, 6 V2 pairs, reserve gating, and >4 decimal check
+    await wdClick(base, sessionId, '[data-testid="tab-send"]');
+    await waitForSelectorWd(base, sessionId, '[data-testid="send-view"]', 10_000);
+    await wdFill(base, sessionId, '[data-testid="send-address-input-0"]', "ZEPHYRinvalidchecksum");
+    await wdFill(base, sessionId, '[data-testid="send-amount-input-0"]', "1.25");
+    await wdClick(base, sessionId, '[data-testid="prepare-send-btn"]');
+    await waitForSelectorWd(base, sessionId, '[data-testid="send-error-banner"]', 15_000);
+    assert(
+      (await wdText(base, sessionId, '[data-testid="send-error-banner"]')).includes(
+        "not a valid Zephyr mainnet address"
+      ),
+      "Firefox expected invalid address rejection in Send view"
+    );
+    await wdClick(base, sessionId, '[data-testid="send-mode-sweep"]');
+    await waitForSelectorWd(base, sessionId, '[data-testid="sweep-mode-explainer"]', 5_000);
+    await assertGuards("firefox-send");
+
+    await wdClick(base, sessionId, '[data-testid="tab-convert"]');
+    await waitForSelectorWd(base, sessionId, '[data-testid="convert-view"]', 10_000);
+    await waitForSelectorWd(base, sessionId, '[data-testid="convert-reserve-gate-banner"]', 10_000);
+    for (const pairId of ["ZPH-ZSD", "ZSD-ZPH", "ZPH-ZRS", "ZRS-ZPH", "ZSD-ZYS", "ZYS-ZSD"]) {
+      await waitForSelectorWd(base, sessionId, `[data-testid="convert-pair-${pairId}"]`, 5_000);
+    }
+    await wdClick(base, sessionId, '[data-testid="convert-pair-ZPH-ZRS"]');
+    await wdFill(base, sessionId, '[data-testid="convert-amount-input"]', "2.12345");
+    await waitForSelectorWd(base, sessionId, '[data-testid="convert-amount-error"]', 5_000);
+    assert(
+      (await wdText(base, sessionId, '[data-testid="convert-amount-error"]')).includes(
+        "at most 4 decimal places"
+      ),
+      "Firefox expected >4 decimal conversion rejection"
+    );
+    await assertGuards("firefox-convert");
+
     // 3. Receive view: create & rename subaddress + QR SVG check
     await wdClick(base, sessionId, '[data-testid="tab-receive"]');
     await waitForSelectorWd(base, sessionId, '[data-testid="receive-view"]', 10_000);
@@ -616,6 +719,8 @@ async function verifyFirefox() {
       syncedHeight,
       reopenedCheckpointHeight: reopenedHeight,
       reserveRatioText,
+      sendAndSweepVerified: true,
+      convertAndReserveGateVerified: true,
       subaddressPersistedAcrossLock: true,
       refreshPoolVerified: true,
       consoleErrors: 0,
@@ -632,14 +737,14 @@ async function verifyFirefox() {
 async function main() {
   const only = process.argv[2];
   if (!only || only === "chrome") {
-    console.log("Running Chromium M1.3 MV3 verification...");
+    console.log("Running Chromium M1.4 MV3 verification...");
     const chromeRes = await verifyChrome();
-    console.log("Chromium M1.3 PASS:", JSON.stringify(chromeRes, null, 2));
+    console.log("Chromium M1.4 PASS:", JSON.stringify(chromeRes, null, 2));
   }
   if (!only || only === "firefox") {
-    console.log("Running Firefox M1.3 MV3 verification...");
+    console.log("Running Firefox M1.4 MV3 verification...");
     const firefoxRes = await verifyFirefox();
-    console.log("Firefox M1.3 PASS:", JSON.stringify(firefoxRes, null, 2));
+    console.log("Firefox M1.4 PASS:", JSON.stringify(firefoxRes, null, 2));
   }
 }
 

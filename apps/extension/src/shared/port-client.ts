@@ -5,10 +5,13 @@ import type {
   EngineResponse,
   HostDiagnosticsDto,
   NodeProbeResultDto,
+  PreparedTxDto,
   ProofKind,
+  RelayOutcomeDto,
   ReserveStatusDto,
   RevealedSecretsDto,
   SubaddressDto,
+  TxPriorityDto,
   WalletClient,
   WalletSnapshot,
   WalletTxDto,
@@ -240,6 +243,70 @@ export class PortWalletClient implements WalletClient {
       txHash: params.txHash,
       ...(params.address ? { address: params.address } : {}),
       ...(params.message !== undefined ? { message: params.message } : {})
+    });
+  }
+
+  prepareTransfer(params: {
+    readonly asset: string;
+    readonly destinations: readonly { readonly address: string; readonly amount: string }[];
+    readonly priority?: TxPriorityDto;
+  }): Promise<PreparedTxDto> {
+    return this.request<PreparedTxDto>({
+      type: "PREPARE_TRANSFER",
+      asset: params.asset,
+      destinations: params.destinations,
+      ...(params.priority ? { priority: params.priority } : {})
+    });
+  }
+
+  prepareSweep(params: {
+    readonly asset: string;
+    readonly address: string;
+    readonly priority?: TxPriorityDto;
+  }): Promise<PreparedTxDto> {
+    return this.request<PreparedTxDto>({
+      type: "PREPARE_SWEEP",
+      asset: params.asset,
+      address: params.address,
+      ...(params.priority ? { priority: params.priority } : {})
+    });
+  }
+
+  prepareConversion(params: {
+    readonly sourceAsset: string;
+    readonly destinationAsset: string;
+    readonly amount: string;
+    readonly address?: string;
+    readonly priority?: TxPriorityDto;
+  }): Promise<PreparedTxDto> {
+    return this.request<PreparedTxDto>({
+      type: "PREPARE_CONVERSION",
+      sourceAsset: params.sourceAsset,
+      destinationAsset: params.destinationAsset,
+      amount: params.amount,
+      ...(params.address ? { address: params.address } : {}),
+      ...(params.priority ? { priority: params.priority } : {})
+    });
+  }
+
+  relayPrepared(token: string): Promise<RelayOutcomeDto> {
+    return this.request<RelayOutcomeDto>({
+      type: "RELAY_PREPARED",
+      token
+    });
+  }
+
+  discardPrepared(token: string, verify?: boolean): Promise<WalletSnapshot> {
+    return this.request<WalletSnapshot>({
+      type: "DISCARD_PREPARED",
+      token,
+      ...(verify !== undefined ? { verify } : {})
+    });
+  }
+
+  retryPersist(): Promise<WalletSnapshot> {
+    return this.request<WalletSnapshot>({
+      type: "RETRY_PERSIST"
     });
   }
 

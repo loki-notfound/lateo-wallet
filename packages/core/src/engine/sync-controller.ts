@@ -183,6 +183,7 @@ export class SyncController {
 
     if (this.checkOriginPermission) {
       const granted = await this.checkOriginPermission(this.originPattern);
+      if (this.adapter !== adapter) return this.status;
       if (!granted) {
         this.updateStatus({
           state: "permission-required",
@@ -202,9 +203,11 @@ export class SyncController {
 
     try {
       await adapter.setDaemonConnection(this.nodeUrl);
+      if (this.adapter !== adapter) return this.status;
 
       const daemonHeight = await retryWithBackoff(
         async (attempt) => {
+          if (this.adapter !== adapter) return this.highestDaemonHeight;
           if (attempt > 1) {
             this.updateStatus({
               state: "reconnecting",
@@ -215,8 +218,10 @@ export class SyncController {
         },
         this.retryOptions
       );
+      if (this.adapter !== adapter) return this.status;
       const monotonicDaemon = this.recordDaemonHeight(daemonHeight);
       const beforeHeight = await adapter.getHeight();
+      if (this.adapter !== adapter) return this.status;
       this.updateStatus({
         state: "syncing",
         walletHeight: beforeHeight,
@@ -226,13 +231,14 @@ export class SyncController {
 
       const syncResult = await retryWithBackoff(
         async (attempt) => {
-          if (attempt > 1) {
+          if (attempt > 1 && this.adapter === adapter) {
             this.updateStatus({
               state: "reconnecting",
               errorMessage: `Retrying sync on ${this.nodeHost} (attempt ${attempt})...`
             });
           }
           return adapter.sync((height, _start, endHeight, percentDone) => {
+            if (this.adapter !== adapter) return;
             const monoEnd = this.recordDaemonHeight(endHeight);
             this.updateStatus({
               state: "syncing",
@@ -244,8 +250,10 @@ export class SyncController {
         },
         this.retryOptions
       );
+      if (this.adapter !== adapter) return this.status;
 
       const finalWalletHeight = await adapter.getHeight();
+      if (this.adapter !== adapter) return this.status;
       const finalDaemonHeight = this.recordDaemonHeight(
         Math.max(monotonicDaemon, finalWalletHeight)
       );
@@ -259,12 +267,14 @@ export class SyncController {
 
       if (shouldPersist) {
         await this.onCheckpointRequired(finalWalletHeight);
+        if (this.adapter !== adapter) return this.status;
         this.initialSyncPersisted = true;
         this.lastCheckpointHeight = finalWalletHeight;
         this.updateStatus({ lastCheckpointAt: Date.now() });
       }
 
       await this.onSyncCompleted?.(syncResult);
+      if (this.adapter !== adapter) return this.status;
 
       this.updateStatus({
         state: "synced",
@@ -277,6 +287,7 @@ export class SyncController {
       });
       return this.status;
     } catch (err) {
+      if (this.adapter !== adapter) return this.status;
       const msg =
         err instanceof Error && err.message
           ? `Could not sync with ${this.nodeHost}`

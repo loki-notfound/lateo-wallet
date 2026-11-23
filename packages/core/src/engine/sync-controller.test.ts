@@ -71,4 +71,34 @@ describe("SyncController HA resilience", () => {
     expect(status.state).toBe("permission-required");
     expect(status.permissionOriginRequired).toBe("https://node.lateo.dev/*");
   });
+
+  it("never emits a stale synced status if stop() is called while sync is in flight", async () => {
+    const states: string[] = [];
+    let controller!: SyncController;
+
+    const adapter: SyncAdapter = {
+      setDaemonConnection: async () => {},
+      getHeight: async () => 910_000,
+      getDaemonHeight: async () => 910_010,
+      sync: async () => {
+        // Simulate wallet lock/stop happening while WASM sync is in-flight
+        controller.stop();
+        return { numBlocksFetched: 10, receivedMoney: false };
+      }
+    };
+
+    controller = new SyncController({
+      nodeUrl: "https://node.lateo.dev",
+      onStatusChange: (s) => states.push(s.state),
+      onCheckpointRequired: async () => {
+        throw new Error("Should not checkpoint after stop()");
+      }
+    });
+
+    controller.attach(adapter, 910_000, null);
+    const finalStatus = await controller.syncOnce();
+    expect(finalStatus.state).toBe("idle");
+    expect(states[states.length - 1]).toBe("idle");
+    expect(states).not.toContain("synced");
+  });
 });

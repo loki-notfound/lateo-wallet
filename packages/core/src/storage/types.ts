@@ -10,6 +10,11 @@ export interface VaultBlobStore {
   readBlob(walletId: string, kind: WalletBlobKind): Promise<EncryptedWalletBlobRecord | undefined>;
   writeBlob(record: EncryptedWalletBlobRecord): Promise<void>;
   /**
+   * Atomically persist multiple encrypted wallet blobs (keys + cache) in a
+   * single readwrite transaction (`tx.oncomplete`).
+   */
+  writeBlobsAtomic?(blobs: readonly EncryptedWalletBlobRecord[]): Promise<void>;
+  /**
    * Atomically persist encrypted wallet blobs alongside vault_meta in a single
    * transaction when the backing store supports multi-store transactions.
    */

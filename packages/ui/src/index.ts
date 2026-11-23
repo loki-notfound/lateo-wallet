@@ -1,5 +1,6 @@
 export { default as AddressChunks } from "./components/AddressChunks.svelte";
 export { default as AssetBadge } from "./components/AssetBadge.svelte";
+export { default as ConvertView } from "./components/ConvertView.svelte";
 export { default as HistoryView } from "./components/HistoryView.svelte";
 export { default as NodeSwitcher } from "./components/NodeSwitcher.svelte";
 export { default as PasswordFields } from "./components/PasswordFields.svelte";
@@ -7,8 +8,10 @@ export { default as QrCode } from "./components/QrCode.svelte";
 export { default as ReceiveView } from "./components/ReceiveView.svelte";
 export { default as ReserveBanner } from "./components/ReserveBanner.svelte";
 export { default as SeedBackupFlow } from "./components/SeedBackupFlow.svelte";
+export { default as SendView } from "./components/SendView.svelte";
 export { default as SettingsSecurity } from "./components/SettingsSecurity.svelte";
 export { default as SyncStatusBar } from "./components/SyncStatusBar.svelte";
+export { default as TxReviewPanel } from "./components/TxReviewPanel.svelte";
 export { default as UnlockScreen } from "./components/UnlockScreen.svelte";
 export { default as WalletApp } from "./components/WalletApp.svelte";
 export { default as WelcomeOnboarding } from "./components/WelcomeOnboarding.svelte";

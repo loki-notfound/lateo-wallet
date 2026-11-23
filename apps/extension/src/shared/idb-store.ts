@@ -91,6 +91,34 @@ export class IndexedDbVaultStore implements VaultBlobStore {
     await runTx(STORE_BLOBS, "readwrite", (s) => s.put(record));
   }
 
+  async writeBlobsAtomic(blobs: readonly EncryptedWalletBlobRecord[]): Promise<void> {
+    const db = await openDb();
+    return new Promise<void>((resolve, reject) => {
+      let settled = false;
+      const fail = (err: unknown): void => {
+        if (settled) return;
+        settled = true;
+        db.close();
+        reject(err instanceof Error ? err : new Error("Atomic wallet blobs write failed"));
+      };
+
+      const tx = db.transaction(STORE_BLOBS, "readwrite");
+      const blobStore = tx.objectStore(STORE_BLOBS);
+      for (const blob of blobs) {
+        blobStore.put(blob);
+      }
+
+      tx.oncomplete = () => {
+        if (settled) return;
+        settled = true;
+        db.close();
+        resolve();
+      };
+      tx.onabort = () => fail(tx.error ?? new Error("Atomic wallet blobs transaction aborted"));
+      tx.onerror = () => fail(tx.error ?? new Error("Atomic wallet blobs transaction error"));
+    });
+  }
+
   async writeVaultAtomic(
     meta: EncryptedVaultMetaRecord,
     blobs: readonly EncryptedWalletBlobRecord[]

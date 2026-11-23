@@ -20,10 +20,15 @@ import type {
   CreateWalletResultDto,
   HostKind,
   NodeProbeResultDto,
+  PersistFailureDto,
+  PreparedTxDto,
   ProofKind,
+  RelayOutcomeDto,
   ReserveStatusDto,
   RevealedSecretsDto,
+  SavingKind,
   SubaddressDto,
+  TxPriorityDto,
   WalletSnapshot,
   WalletSummaryDto,
   WalletTxDto,
@@ -55,6 +60,7 @@ import {
   type WalletManifestEntry
 } from "../vault/types.js";
 import { DEFAULT_SYNC_INTERVAL_MS, SyncController } from "./sync-controller.js";
+import { TxFlowController, TxFlowError } from "./tx-flow.js";
 
 const DEFAULT_HEIGHT_FETCH_TIMEOUT_MS = 4_000;
 const NODE_PROBE_TIMEOUT_MS = 6_000;
@@ -71,6 +77,9 @@ export interface WalletEngineOptions {
   readonly heightFetchTimeoutMs?: number;
   readonly checkOriginPermission?: (originPattern: string) => Promise<boolean>;
   readonly fetchDaemonHeight?: (network: ZephyrNetwork) => Promise<number | null>;
+  readonly validateAddressFn?: (address: string, network: ZephyrNetwork) => Promise<void>;
+  readonly relayTimeoutMs?: number;
+  readonly preparedTxTtlMs?: number;
   readonly wasmModuleUrl?: string;
   readonly workerDistPath?: string;
   readonly onSnapshot?: (snapshot: WalletSnapshot) => void;
@@ -190,10 +199,13 @@ export class WalletEngine {
     | ((originPattern: string) => Promise<boolean>)
     | undefined;
   private readonly fetchDaemonHeightFn: (network: ZephyrNetwork) => Promise<number | null>;
+  private readonly validateAddressFn: (address: string, network: ZephyrNetwork) => Promise<void>;
   private readonly onSnapshot: ((snapshot: WalletSnapshot) => void) | undefined;
+  private readonly onSyncBusyChange: ((busy: boolean) => void) | undefined;
 
   private readonly syncController: SyncController;
   private readonly reserveService = new ReserveService();
+  private readonly txFlow: TxFlowController;
 
   private activeNodeUrl: string;
   private queue: Promise<unknown> = Promise.resolve();
@@ -204,6 +216,11 @@ export class WalletEngine {
   private kdf: KdfDescriptor | null = null;
   private dekKey: CryptoKey | null = null;
   private savingState = false;
+  private savingKind: SavingKind | null = null;
+  private persistFailure: PersistFailureDto | null = null;
+  private postRelaySavePromise: Promise<void> | null = null;
+  private syncBusy = false;
+  private relayBusy = false;
   private lastPersistedAt: number | null = null;
   private cachedBalances: readonly BalanceEntryDto[] = [];
 
@@ -222,7 +239,11 @@ export class WalletEngine {
         network === "mainnet"
           ? fetchHeightFromDaemon(this.activeNodeUrl, this.heightFetchTimeoutMs)
           : Promise.resolve(null));
+    this.validateAddressFn =
+      options.validateAddressFn ??
+      ((address, network) => validateAddress(address, network, this.proxyToWorker));
     this.onSnapshot = options.onSnapshot;
+    this.onSyncBusyChange = options.onSyncBusyChange;
 
     this.syncController = new SyncController({
       nodeUrl: this.activeNodeUrl,
@@ -233,10 +254,18 @@ export class WalletEngine {
       onStatusChange: () => {
         void this.emitSnapshot();
       },
-      ...(options.onSyncBusyChange ? { onBusyChange: options.onSyncBusyChange } : {}),
+      onBusyChange: (busy) => {
+        this.syncBusy = busy;
+        this.emitBusyState();
+      },
       onCheckpointRequired: async () => {
         if (this.activeWallet && this.activeEntry && this.dekKey) {
-          await this.persistActiveWalletBlobs(this.activeWallet, this.activeEntry.id, this.dekKey);
+          await this.persistActiveWalletBlobs(
+            this.activeWallet,
+            this.activeEntry.id,
+            this.dekKey,
+            "checkpoint"
+          );
         }
       },
       onSyncCompleted: async () => {
@@ -250,8 +279,66 @@ export class WalletEngine {
           } catch {
             // Reserve banner remains at last known good reading on transient failure
           }
+          this.txFlow.checkExpiry();
         }
       }
+    });
+
+    this.txFlow = new TxFlowController({
+      validateAddress: (address, network) => this.validateAddressFn(address, network),
+      getDaemonHeight: () => {
+        const sync = this.syncController.getStatus();
+        const reserveHeight = this.reserveService.getCached()?.height ?? 0;
+        return Math.max(sync.daemonHeight, sync.walletHeight, reserveHeight);
+      },
+      getReserve: () => this.reserveService.getCached(),
+      getNode: () => {
+        const validated = validateNodeUrl(this.activeNodeUrl);
+        return { url: validated.url, host: validated.host };
+      },
+      getUnlockedBalance: (asset) => {
+        const entry = this.cachedBalances.find((b) => b.asset === asset);
+        if (!entry) return null;
+        return BigInt(entry.unlocked);
+      },
+      blockNewTransaction: () =>
+        this.persistFailure
+          ? "A previous transaction was relayed, but wallet state has not been saved to disk yet. Retry saving first."
+          : null,
+      beforeRelay: async () => {
+        this.relayBusy = true;
+        this.emitBusyState();
+        const validated = validateNodeUrl(this.activeNodeUrl);
+        if (this.checkOriginPermission) {
+          const granted = await this.checkOriginPermission(validated.originPattern);
+          if (!granted) {
+            throw new TxFlowError(
+              "BUILD_FAILED",
+              `Host permission required for ${validated.host}`
+            );
+          }
+        }
+        if (this.activeWallet) {
+          await this.activeWallet.setDaemonConnection(this.activeNodeUrl);
+        }
+      },
+      afterRelay: () => {
+        this.relayBusy = false;
+        this.emitBusyState();
+      },
+      persistAfterRelay: async (txHashes) => {
+        await this.persistPostRelayBlobs(txHashes);
+      },
+      onLateRelayAccepted: (txHashes) => {
+        void this.persistPostRelayBlobs(txHashes).catch(() => {
+          // persistFailure is already recorded on the snapshot for user retry
+        });
+      },
+      onChange: () => {
+        void this.emitSnapshot();
+      },
+      ...(options.relayTimeoutMs !== undefined ? { relayTimeoutMs: options.relayTimeoutMs } : {}),
+      ...(options.preparedTxTtlMs !== undefined ? { ttlMs: options.preparedTxTtlMs } : {})
     });
 
     if (options.workerDistPath) {
@@ -297,6 +384,9 @@ export class WalletEngine {
       hasVault: meta !== undefined,
       locked: this.activeWallet === null,
       savingState: this.savingState,
+      savingKind: this.savingKind,
+      pendingTx: this.txFlow.getPending(),
+      persistFailure: this.persistFailure,
       activeWallet: activeSummary,
       balances: this.cachedBalances,
       sync: this.syncController.getStatus(),
@@ -304,6 +394,26 @@ export class WalletEngine {
       lastPersistedAt: this.lastPersistedAt,
       hostKind: this.hostKind
     };
+  }
+
+  private emitBusyState(): void {
+    this.onSyncBusyChange?.(
+      this.syncBusy ||
+        this.relayBusy ||
+        this.savingState ||
+        this.postRelaySavePromise !== null ||
+        this.persistFailure !== null
+    );
+  }
+
+  isSavingOrRelayCritical(): boolean {
+    return (
+      this.savingState ||
+      this.relayBusy ||
+      this.txFlow.isRelayInFlight() ||
+      this.postRelaySavePromise !== null ||
+      this.persistFailure !== null
+    );
   }
 
   async getSnapshot(): Promise<WalletSnapshot> {
@@ -375,6 +485,8 @@ export class WalletEngine {
     metaRecord: EncryptedVaultMetaRecord
   ): Promise<void> {
     this.savingState = true;
+    this.savingKind = "checkpoint";
+    this.emitBusyState();
     await this.emitSnapshot();
     try {
       const blobs = await this.encryptActiveWalletBlobs(wallet, walletId, dekKey);
@@ -388,23 +500,74 @@ export class WalletEngine {
       this.lastPersistedAt = Date.now();
     } finally {
       this.savingState = false;
+      this.savingKind = null;
+      this.emitBusyState();
     }
   }
 
   private async persistActiveWalletBlobs(
     wallet: ZephyrWallet,
     walletId: string,
-    dekKey: CryptoKey
+    dekKey: CryptoKey,
+    kind: SavingKind = "checkpoint"
   ): Promise<void> {
     this.savingState = true;
+    this.savingKind = kind;
+    this.emitBusyState();
     await this.emitSnapshot();
     try {
       const [encKeys, encCache] = await this.encryptActiveWalletBlobs(wallet, walletId, dekKey);
-      await this.store.writeBlob(encKeys);
-      await this.store.writeBlob(encCache);
+      if (this.store.writeBlobsAtomic) {
+        await this.store.writeBlobsAtomic([encKeys, encCache]);
+      } else {
+        await this.store.writeBlob(encKeys);
+        await this.store.writeBlob(encCache);
+      }
       this.lastPersistedAt = Date.now();
+      this.persistFailure = null;
     } finally {
       this.savingState = false;
+      this.savingKind = null;
+      this.emitBusyState();
+    }
+  }
+
+  private async persistPostRelayBlobs(txHashes: readonly string[]): Promise<void> {
+    const wallet = this.activeWallet;
+    const entry = this.activeEntry;
+    const dekKey = this.dekKey;
+    if (!wallet || !entry || !dekKey) {
+      throw new Error("Active wallet session missing during post-relay save");
+    }
+    const run = (async () => {
+      try {
+        await this.persistActiveWalletBlobs(wallet, entry.id, dekKey, "post-relay");
+        this.cachedBalances = await this.readBalances(wallet);
+      } catch (err) {
+        this.persistFailure = {
+          txHashes: [...txHashes],
+          failedAt: Date.now(),
+          message:
+            err instanceof Error && err.message
+              ? err.message
+              : "IndexedDB commit failed after relay"
+        };
+        this.emitBusyState();
+        throw err;
+      } finally {
+        await this.emitSnapshot();
+      }
+    })();
+    this.postRelaySavePromise = run.then(
+      () => undefined,
+      () => undefined
+    );
+    this.emitBusyState();
+    try {
+      await run;
+    } finally {
+      this.postRelaySavePromise = null;
+      this.emitBusyState();
     }
   }
 
@@ -477,6 +640,7 @@ export class WalletEngine {
         this.kdf = kdf;
         this.dekKey = dekKey;
         this.cachedBalances = await this.readBalances(wallet);
+        this.txFlow.attach(wallet, entry.network, entry.viewOnly);
         this.attachSyncForActiveWallet(wallet, await wallet.getHeight());
         const snapshot = await this.emitSnapshot();
 
@@ -563,6 +727,7 @@ export class WalletEngine {
         this.kdf = kdf;
         this.dekKey = dekKey;
         this.cachedBalances = await this.readBalances(wallet);
+        this.txFlow.attach(wallet, entry.network, entry.viewOnly);
         this.attachSyncForActiveWallet(wallet, await wallet.getHeight());
         return await this.emitSnapshot();
       } catch (err) {
@@ -657,6 +822,7 @@ export class WalletEngine {
         this.kdf = kdf;
         this.dekKey = dekKey;
         this.cachedBalances = await this.readBalances(wallet);
+        this.txFlow.attach(wallet, entry.network, entry.viewOnly);
         this.attachSyncForActiveWallet(wallet, await wallet.getHeight());
         return await this.emitSnapshot();
       } catch (err) {
@@ -753,6 +919,7 @@ export class WalletEngine {
         this.dekKey = dekKey;
         this.lastPersistedAt = encCache?.updatedAt ?? encKeys.updatedAt;
         this.cachedBalances = await this.readBalances(wallet);
+        this.txFlow.attach(wallet, normalizedEntry.network, normalizedEntry.viewOnly);
         const restoredWalletHeight = Math.max(
           await wallet.getHeight(),
           encCache?.syncedHeight ?? 0
@@ -926,6 +1093,7 @@ export class WalletEngine {
     return this.enqueue(async () => {
       const validated = validateNodeUrl(rawUrl);
       this.activeNodeUrl = validated.url;
+      this.txFlow.release();
       this.syncController.setNodeUrl(validated.url);
       this.reserveService.resetForNodeSwitch();
       if (this.activeWallet) {
@@ -1039,8 +1207,137 @@ export class WalletEngine {
     });
   }
 
-  async lockWallet(): Promise<WalletSnapshot> {
+  async prepareTransfer(params: {
+    readonly asset: string;
+    readonly destinations: readonly { readonly address: string; readonly amount: string }[];
+    readonly priority?: TxPriorityDto;
+  }): Promise<PreparedTxDto> {
     return this.enqueue(async () => {
+      if (this.activeWallet) {
+        await this.activeWallet.setDaemonConnection(this.activeNodeUrl);
+      }
+      return this.txFlow.prepareTransfer(params);
+    });
+  }
+
+  async prepareSweep(params: {
+    readonly asset: string;
+    readonly address: string;
+    readonly priority?: TxPriorityDto;
+  }): Promise<PreparedTxDto> {
+    return this.enqueue(async () => {
+      if (this.activeWallet) {
+        await this.activeWallet.setDaemonConnection(this.activeNodeUrl);
+      }
+      return this.txFlow.prepareSweep(params);
+    });
+  }
+
+  async prepareConversion(params: {
+    readonly sourceAsset: string;
+    readonly destinationAsset: string;
+    readonly amount: string;
+    readonly address?: string;
+    readonly priority?: TxPriorityDto;
+  }): Promise<PreparedTxDto> {
+    return this.enqueue(async () => {
+      if (this.activeWallet) {
+        await this.activeWallet.setDaemonConnection(this.activeNodeUrl);
+      }
+      return this.txFlow.prepareConversion(params);
+    });
+  }
+
+  async relayPrepared(token: string): Promise<RelayOutcomeDto> {
+    return this.enqueue(() => this.txFlow.relay(token));
+  }
+
+  async discardPrepared(token: string, verify = false): Promise<WalletSnapshot> {
+    return this.enqueue(async () => {
+      const { wasRelayUnknown } = await this.txFlow.discard(token);
+      if ((verify || wasRelayUnknown) && this.activeWallet) {
+        try {
+          await this.activeWallet.setDaemonConnection(this.activeNodeUrl);
+          await this.activeWallet.refreshPool().catch(() => 0);
+          await this.syncController.syncOnce();
+          if (this.activeWallet) {
+            this.cachedBalances = await this.readBalances(this.activeWallet);
+          }
+        } catch {
+          // Best-effort pool refresh + sync verification after discard
+        }
+      }
+      return await this.emitSnapshot();
+    });
+  }
+
+  async retryPersist(): Promise<WalletSnapshot> {
+    return this.enqueue(async () => {
+      if (!this.activeWallet || !this.activeEntry || !this.dekKey) {
+        throw new TxFlowError("LOCKED", "Wallet must be unlocked");
+      }
+      const hashes = this.persistFailure?.txHashes ?? [];
+      await this.persistPostRelayBlobs(hashes);
+      return await this.emitSnapshot();
+    });
+  }
+
+  async releasePrepared(): Promise<WalletSnapshot> {
+    return this.enqueue(async () => {
+      this.txFlow.release();
+      return await this.emitSnapshot();
+    });
+  }
+
+  /**
+   * Test seam: attach an offline/mocked wallet into the active engine session
+   * with pre-populated balances and reserve status so M1.4 prepare/relay/save
+   * flows can be exercised deterministically without broadcasting to mainnet.
+   */
+  attachTestWalletSession(params: {
+    readonly wallet: ZephyrWallet;
+    readonly entry: WalletManifestEntry;
+    readonly dekKey: CryptoKey;
+    readonly balances?: readonly BalanceEntryDto[];
+    readonly reserve?: ReserveStatusDto | null;
+    readonly daemonHeight?: number;
+  }): void {
+    this.activeWallet = params.wallet;
+    this.activeEntry = params.entry;
+    this.dekKey = params.dekKey;
+    this.cachedBalances =
+      params.balances ??
+      V2_ASSET_CODES.map((asset) => ({
+        asset,
+        total: "0",
+        unlocked: "0",
+        locked: "0"
+      }));
+    if (params.reserve !== undefined) {
+      this.reserveService.seedCachedForTest(params.reserve);
+    }
+    this.txFlow.attach(params.wallet, params.entry.network, params.entry.viewOnly);
+    this.attachSyncForActiveWallet(params.wallet, params.daemonHeight ?? params.entry.restoreHeight);
+  }
+
+  async lockWallet(): Promise<WalletSnapshot> {
+    if (this.postRelaySavePromise) {
+      await this.postRelaySavePromise;
+    }
+    return this.enqueue(async () => {
+      if (this.postRelaySavePromise) {
+        await this.postRelaySavePromise;
+      }
+      if (this.persistFailure && this.activeWallet && this.activeEntry && this.dekKey) {
+        try {
+          await this.persistPostRelayBlobs(this.persistFailure.txHashes);
+        } catch {
+          throw new TxFlowError(
+            "LOCK_DEFERRED",
+            "Cannot lock wallet while post-relay wallet state has not been saved to disk. Retry saving first."
+          );
+        }
+      }
       await this.closeActiveWalletInternal(true);
       return await this.emitSnapshot();
     });
@@ -1048,6 +1345,7 @@ export class WalletEngine {
 
   async resetVault(): Promise<WalletSnapshot> {
     return this.enqueue(async () => {
+      this.persistFailure = null;
       await this.closeActiveWalletInternal(false);
       await this.store.clearAll();
       this.lastPersistedAt = null;
@@ -1056,6 +1354,10 @@ export class WalletEngine {
   }
 
   private async closeActiveWalletInternal(persistBeforeClose: boolean): Promise<void> {
+    if (this.postRelaySavePromise) {
+      await this.postRelaySavePromise;
+    }
+    await this.txFlow.detach();
     this.syncController.stop();
     this.reserveService.resetForNodeSwitch();
 
@@ -1065,7 +1367,7 @@ export class WalletEngine {
 
     if (wallet && persistBeforeClose && entry && dekKey) {
       try {
-        await this.persistActiveWalletBlobs(wallet, entry.id, dekKey);
+        await this.persistActiveWalletBlobs(wallet, entry.id, dekKey, "checkpoint");
       } catch {
         // Proceed to close/terminate even if final checkpoint fails on lock
       }
@@ -1077,7 +1379,9 @@ export class WalletEngine {
     this.kek = null;
     this.kdf = null;
     this.dekKey = null;
+    this.persistFailure = null;
     this.cachedBalances = [];
+    this.emitBusyState();
 
     if (wallet) {
       await this.safeCloseOrTerminate(wallet);
@@ -1102,4 +1406,4 @@ export class WalletEngine {
   }
 }
 
-export { VaultAuthError };
+export { TxFlowError, VaultAuthError };

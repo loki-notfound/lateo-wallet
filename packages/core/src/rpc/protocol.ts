@@ -140,10 +140,110 @@ export interface WalletSummaryDto {
   readonly seedBackupVerified: boolean;
 }
 
+export type TxPriorityDto = "default" | "unimportant" | "normal" | "elevated";
+export type PreparedTxKind = "transfer" | "sweep" | "conversion";
+/**
+ * `ready`: built, awaiting review + Confirm & Relay.
+ * `relay-unknown`: a relay attempt ended without a usable answer (or only part
+ * of a multi-transaction build was accepted); the exact signed build is kept so
+ * the user can explicitly retry it or discard and sync to verify.
+ */
+export type PreparedTxStatus = "ready" | "relay-unknown";
+export type RelayTxOutcomeDto = "accepted" | "rejected" | "unknown" | "notSent";
+
+export interface PreparedTxPartDto {
+  readonly hash: string;
+  readonly amount: string;
+  readonly fee: string;
+  readonly feeAsset: string;
+  readonly totalDebited: string;
+  readonly outcome: RelayTxOutcomeDto | null;
+}
+
+export interface PreparedDestinationDto {
+  readonly address: string;
+  readonly amount: string;
+}
+
+/**
+ * Review description of a prepared transaction. `token` is an opaque,
+ * short-lived engine handle; signed bytes and keys never leave the engine.
+ */
+export interface PreparedTxDto {
+  readonly token: string;
+  readonly kind: PreparedTxKind;
+  readonly status: PreparedTxStatus;
+  readonly sourceAsset: string;
+  readonly destinationAsset: string;
+  readonly destinations: readonly PreparedDestinationDto[];
+  readonly txs: readonly PreparedTxPartDto[];
+  readonly totalAmount: string;
+  readonly totalFee: string;
+  readonly feeAsset: string;
+  readonly totalDebited: string;
+  readonly amountMinted: string | null;
+  readonly pricingRecordHeight: number | null;
+  readonly pricingRecordExpiresAtHeight: number | null;
+  readonly daemonHeightAtPrepare: number;
+  readonly priority: TxPriorityDto;
+  readonly nodeUrl: string;
+  readonly nodeHost: string;
+  readonly preparedAt: number;
+  readonly expiresAt: number;
+  readonly relayAttempts: number;
+  readonly maxRelayAttempts: number;
+  readonly lastRelayError: string | null;
+}
+
+export type SavingKind = "post-relay" | "checkpoint";
+
+export interface PersistFailureDto {
+  readonly txHashes: readonly string[];
+  readonly failedAt: number;
+  readonly message: string;
+}
+
+export type RelayOutcomeDto =
+  | {
+      readonly kind: "relayed";
+      readonly txHashes: readonly string[];
+      readonly relayedAt: number;
+      readonly nodeHost: string;
+      readonly persisted: true;
+    }
+  | {
+      readonly kind: "relayed-unsaved";
+      readonly txHashes: readonly string[];
+      readonly relayedAt: number;
+      readonly nodeHost: string;
+      readonly message: string;
+    }
+  | {
+      readonly kind: "relay-unknown";
+      readonly pending: PreparedTxDto;
+      readonly reason: string;
+      readonly message: string;
+      readonly canRetry: boolean;
+      readonly persisted: boolean;
+    }
+  | {
+      readonly kind: "rejected";
+      readonly reason: string;
+      readonly message: string;
+    }
+  | {
+      readonly kind: "expired";
+      readonly reason: string;
+      readonly message: string;
+    };
+
 export interface WalletSnapshot {
   readonly hasVault: boolean;
   readonly locked: boolean;
   readonly savingState: boolean;
+  readonly savingKind: SavingKind | null;
+  readonly pendingTx: PreparedTxDto | null;
+  readonly persistFailure: PersistFailureDto | null;
   readonly activeWallet: WalletSummaryDto | null;
   readonly balances: readonly BalanceEntryDto[];
   readonly sync: SyncStatusDto;
@@ -276,7 +376,39 @@ export type EngineRequest =
       readonly txHash: string;
       readonly address?: string;
       readonly message?: string;
-    };
+    }
+  | {
+      readonly id: string;
+      readonly type: "PREPARE_TRANSFER";
+      readonly asset: string;
+      readonly destinations: readonly { readonly address: string; readonly amount: string }[];
+      readonly priority?: TxPriorityDto;
+    }
+  | {
+      readonly id: string;
+      readonly type: "PREPARE_SWEEP";
+      readonly asset: string;
+      readonly address: string;
+      readonly priority?: TxPriorityDto;
+    }
+  | {
+      readonly id: string;
+      readonly type: "PREPARE_CONVERSION";
+      readonly sourceAsset: string;
+      readonly destinationAsset: string;
+      readonly amount: string;
+      readonly address?: string;
+      readonly priority?: TxPriorityDto;
+    }
+  | { readonly id: string; readonly type: "RELAY_PREPARED"; readonly token: string }
+  | {
+      readonly id: string;
+      readonly type: "DISCARD_PREPARED";
+      readonly token: string;
+      readonly verify?: boolean;
+    }
+  | { readonly id: string; readonly type: "RETRY_PERSIST" }
+  | { readonly id: string; readonly type: "RELEASE_PREPARED" };
 
 export type EngineRequestPayload =
   EngineRequest extends infer R ? (R extends EngineRequest ? Omit<R, "id"> : never) : never;
@@ -346,5 +478,43 @@ export interface WalletClient {
     readonly address?: string;
     readonly message?: string;
   }): Promise<string>;
+  prepareTransfer(params: {
+    readonly asset: string;
+    readonly destinations: readonly { readonly address: string; readonly amount: string }[];
+    readonly priority?: TxPriorityDto;
+  }): Promise<PreparedTxDto>;
+  prepareSweep(params: {
+    readonly asset: string;
+    readonly address: string;
+    readonly priority?: TxPriorityDto;
+  }): Promise<PreparedTxDto>;
+  prepareConversion(params: {
+    readonly sourceAsset: string;
+    readonly destinationAsset: string;
+    readonly amount: string;
+    readonly address?: string;
+    readonly priority?: TxPriorityDto;
+  }): Promise<PreparedTxDto>;
+  relayPrepared(token: string): Promise<RelayOutcomeDto>;
+  discardPrepared(token: string, verify?: boolean): Promise<WalletSnapshot>;
+  retryPersist(): Promise<WalletSnapshot>;
   subscribe(listener: (snapshot: WalletSnapshot) => void): () => void;
 }
+
+/** Error codes the engine attaches to rejected transaction-flow requests. */
+export type TxFlowErrorCode =
+  | "LOCKED"
+  | "VIEW_ONLY"
+  | "INVALID_ASSET"
+  | "INVALID_ADDRESS"
+  | "INVALID_AMOUNT"
+  | "INVALID_DESTINATIONS"
+  | "INVALID_PRIORITY"
+  | "INSUFFICIENT_FUNDS"
+  | "RESERVE_BLOCKED"
+  | "PRICING_RECORD_EXPIRED"
+  | "RELAY_PENDING"
+  | "SAVE_PENDING"
+  | "TOKEN_UNKNOWN"
+  | "BUILD_FAILED"
+  | "LOCK_DEFERRED";

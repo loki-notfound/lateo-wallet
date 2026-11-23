@@ -22,6 +22,7 @@ let enginePort: chrome.runtime.Port | null = null;
 let enginePortWaiters: Array<(port: chrome.runtime.Port) => void> = [];
 let creatingOffscreen: Promise<void> | null = null;
 let walletUnlocked = false;
+let engineSavingOrCritical = false;
 
 const pendingEngineCalls = new Map<
   string,
@@ -124,6 +125,9 @@ async function buildLockedSnapshot(): Promise<WalletSnapshot> {
     hasVault: meta !== undefined,
     locked: true,
     savingState: false,
+    savingKind: null,
+    pendingTx: null,
+    persistFailure: null,
     activeWallet: null,
     balances: [],
     sync: {
@@ -195,8 +199,12 @@ async function handleUiRequest(req: EngineRequest): Promise<EngineResponse> {
 
     if (req.type === "LOCK_WALLET") {
       if (await hasOffscreenDocument()) {
-        await forwardToEngine(req);
+        const res = await forwardToEngine(req);
+        if (!res.ok) {
+          return res;
+        }
       }
+      engineSavingOrCritical = false;
       await closeOffscreenDocument();
       await clearAutoLockAlarm();
       const lockedSnap = await buildLockedSnapshot();
@@ -254,7 +262,14 @@ async function handleUiRequest(req: EngineRequest): Promise<EngineResponse> {
       req.type === "SET_SUBADDRESS_LABEL" ||
       req.type === "GET_HISTORY" ||
       req.type === "REFRESH_POOL" ||
-      req.type === "EXPORT_TX_PROOF"
+      req.type === "EXPORT_TX_PROOF" ||
+      req.type === "PREPARE_TRANSFER" ||
+      req.type === "PREPARE_SWEEP" ||
+      req.type === "PREPARE_CONVERSION" ||
+      req.type === "RELAY_PREPARED" ||
+      req.type === "DISCARD_PREPARED" ||
+      req.type === "RETRY_PERSIST" ||
+      req.type === "RELEASE_PREPARED"
     ) {
       if (!(await hasOffscreenDocument())) {
         return {
@@ -266,8 +281,18 @@ async function handleUiRequest(req: EngineRequest): Promise<EngineResponse> {
       const res = await forwardToEngine(req);
       if (res.ok) {
         await resetAutoLockAlarm();
-        if (req.type === "MARK_SEED_BACKUP_VERIFIED" || req.type === "SYNC_NOW") {
+        if (
+          req.type === "MARK_SEED_BACKUP_VERIFIED" ||
+          req.type === "SYNC_NOW" ||
+          req.type === "DISCARD_PREPARED" ||
+          req.type === "RETRY_PERSIST" ||
+          req.type === "RELEASE_PREPARED"
+        ) {
           const snap = { ...(res.result as WalletSnapshot), offscreenActive: true };
+          engineSavingOrCritical =
+            snap.savingState ||
+            snap.persistFailure !== null ||
+            snap.pendingTx?.status === "relay-unknown";
           broadcastEvent({ type: "SNAPSHOT_UPDATED", snapshot: snap });
           return { id: req.id, ok: true, result: snap };
         }
@@ -375,6 +400,10 @@ chrome.runtime.onConnect.addListener((port) => {
       if ("type" in msg && (msg as EngineEvent).type === "SNAPSHOT_UPDATED") {
         const ev = msg as EngineEvent;
         walletUnlocked = !ev.snapshot.locked;
+        engineSavingOrCritical =
+          ev.snapshot.savingState ||
+          ev.snapshot.persistFailure !== null ||
+          ev.snapshot.pendingTx?.status === "relay-unknown";
         broadcastEvent({
           type: "SNAPSHOT_UPDATED",
           snapshot: { ...ev.snapshot, offscreenActive: true }
@@ -421,6 +450,12 @@ chrome.runtime.onConnect.addListener((port) => {
     });
     port.onDisconnect.addListener(() => {
       uiPorts.delete(port);
+      if (uiPorts.size === 0 && walletUnlocked && !engineSavingOrCritical) {
+        void handleUiRequest({
+          id: `disconnect-release-${Date.now()}`,
+          type: "RELEASE_PREPARED"
+        }).catch(() => {});
+      }
     });
     return;
   }
@@ -430,5 +465,9 @@ chrome.runtime.onConnect.addListener((port) => {
 
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name !== AUTO_LOCK_ALARM) return;
+  if (engineSavingOrCritical) {
+    void resetAutoLockAlarm();
+    return;
+  }
   void handleUiRequest({ id: `alarm-${Date.now()}`, type: "LOCK_WALLET" });
 });

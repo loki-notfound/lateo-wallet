@@ -3,6 +3,7 @@
   import type {
     CreateWalletResultDto,
     HostDiagnosticsDto,
+    PreparedTxDto,
     WalletClient,
     WalletSnapshot
   } from "@lateo-wallet/core/rpc";
@@ -10,12 +11,15 @@
   import type { SurfaceMode } from "../types.js";
   import AddressChunks from "./AddressChunks.svelte";
   import AssetBadge from "./AssetBadge.svelte";
+  import ConvertView from "./ConvertView.svelte";
   import HistoryView from "./HistoryView.svelte";
   import ReceiveView from "./ReceiveView.svelte";
   import ReserveBanner from "./ReserveBanner.svelte";
   import SeedBackupFlow from "./SeedBackupFlow.svelte";
+  import SendView from "./SendView.svelte";
   import SettingsSecurity from "./SettingsSecurity.svelte";
   import SyncStatusBar from "./SyncStatusBar.svelte";
+  import TxReviewPanel from "./TxReviewPanel.svelte";
   import UnlockScreen from "./UnlockScreen.svelte";
   import WelcomeOnboarding from "./WelcomeOnboarding.svelte";
 
@@ -37,7 +41,7 @@
     onRequestOriginPermission
   }: Props = $props();
 
-  type WalletTab = "overview" | "receive" | "history" | "security";
+  type WalletTab = "overview" | "send" | "convert" | "receive" | "history" | "security";
 
   let snapshot = $state<WalletSnapshot | null>(null);
   let diagnostics = $state<HostDiagnosticsDto | null>(null);
@@ -46,6 +50,13 @@
   let activeTab = $state<WalletTab>("overview");
   let busy = $state(false);
   let reserveBusy = $state(false);
+  let txFlowBusy = $state(false);
+  let txFlowError = $state<string | null>(null);
+  let relayReceipt = $state<{
+    readonly txHashes: readonly string[];
+    readonly relayedAt: number;
+    readonly nodeHost: string;
+  } | null>(null);
   let errorMsg = $state<string | null>(null);
 
   const surfaceClass = $derived(`lt-app-shell lt-ext-surface-${surface}`);
@@ -174,6 +185,79 @@
     prefs = nextPrefs;
     onThemeApplied?.(nextPrefs.theme);
   }
+
+  function handlePrepared(prepared: PreparedTxDto): void {
+    txFlowError = null;
+    relayReceipt = null;
+    if (snapshot) {
+      snapshot = { ...snapshot, pendingTx: prepared };
+    }
+  }
+
+  async function handleConfirmRelay(token: string): Promise<void> {
+    errorMsg = null;
+    txFlowError = null;
+    txFlowBusy = true;
+    try {
+      const outcome = await client.relayPrepared(token);
+      snapshot = await client.getSnapshot();
+      if (outcome.kind === "relayed") {
+        relayReceipt = {
+          txHashes: outcome.txHashes,
+          relayedAt: outcome.relayedAt,
+          nodeHost: outcome.nodeHost
+        };
+      } else if (outcome.kind === "relayed-unsaved") {
+        txFlowError = outcome.message;
+      } else if (outcome.kind === "rejected" || outcome.kind === "expired") {
+        txFlowError = outcome.message;
+      }
+    } catch (err) {
+      txFlowError = err instanceof Error ? err.message : "Relay failed";
+      try {
+        snapshot = await client.getSnapshot();
+      } catch {
+        // Ignore secondary snapshot error
+      }
+    } finally {
+      txFlowBusy = false;
+    }
+  }
+
+  async function handleDiscardPrepared(token: string, verify: boolean): Promise<void> {
+    errorMsg = null;
+    txFlowError = null;
+    txFlowBusy = true;
+    try {
+      snapshot = await client.discardPrepared(token, verify);
+    } catch (err) {
+      txFlowError = err instanceof Error ? err.message : "Discard failed";
+    } finally {
+      txFlowBusy = false;
+    }
+  }
+
+  async function handleRetryPersist(): Promise<void> {
+    errorMsg = null;
+    txFlowError = null;
+    txFlowBusy = true;
+    try {
+      const failedHashes = snapshot?.persistFailure?.txHashes ?? [];
+      const nodeHost = snapshot?.sync.nodeHost ?? "node.lateo.dev";
+      snapshot = await client.retryPersist();
+      if (!snapshot.persistFailure && failedHashes.length > 0) {
+        relayReceipt = {
+          txHashes: failedHashes,
+          relayedAt: Date.now(),
+          nodeHost
+        };
+      }
+    } catch (err) {
+      errorMsg = err instanceof Error ? err.message : "Retry save failed";
+    } finally {
+      txFlowBusy = false;
+    }
+  }
 </script>
 
 <div class={surfaceClass} data-surface={surface}>
@@ -204,7 +288,7 @@
         <button
           type="button"
           class="lt-btn lt-btn-secondary"
-          disabled={busy}
+          disabled={busy || snapshot.savingState || txFlowBusy}
           onclick={handleLock}
           data-testid="lock-btn"
         >
@@ -225,6 +309,98 @@
       <div class="lt-alert lt-alert-info lt-screen-only" role="status" data-testid="saving-banner">
         <div class="lt-alert-body">Saving wallet state...</div>
       </div>
+      {#if snapshot.savingKind === "post-relay"}
+        <div
+          class="lt-saving-barrier-overlay lt-screen-only"
+          role="alertdialog"
+          aria-modal="true"
+          aria-busy="true"
+          aria-labelledby="post-relay-saving-title"
+          data-testid="post-relay-saving-barrier"
+        >
+          <div class="lt-saving-barrier-card">
+            <div class="lt-sync-row">
+              <strong id="post-relay-saving-title" class="lt-panel-title">
+                Saving wallet state...
+              </strong>
+              <span class="lt-spinner" aria-hidden="true"></span>
+            </div>
+            <p class="lt-compact">
+              Encrypting and committing updated spend keys and transaction cache to IndexedDB. Do
+              not close or lock the wallet until saving completes.
+            </p>
+          </div>
+        </div>
+      {/if}
+    {/if}
+
+    {#if snapshot?.persistFailure}
+      <div
+        class="lt-panel lt-confirm-box lt-stack lt-screen-only"
+        role="alert"
+        data-testid="persist-failure-alert"
+      >
+        <h2 class="lt-panel-title">Critical: Save wallet state before closing</h2>
+        <p class="lt-compact">
+          Your transaction was accepted by the node, but committing the updated wallet state to
+          IndexedDB failed (<bdi>{snapshot.persistFailure.message}</bdi>). Retry saving now so your
+          spend state and transaction keys are persisted.
+        </p>
+        {#if snapshot.persistFailure.txHashes.length > 0}
+          <div class="lt-stack">
+            {#each snapshot.persistFailure.txHashes as hash (hash)}
+              <code class="lt-hash" data-testid="persist-failure-txid"><bdi>{hash}</bdi></code>
+            {/each}
+          </div>
+        {/if}
+        <div class="lt-form-actions">
+          <button
+            type="button"
+            class="lt-btn lt-btn-primary"
+            disabled={txFlowBusy || snapshot.savingState}
+            onclick={handleRetryPersist}
+            data-testid="retry-persist-btn"
+          >
+            {txFlowBusy || snapshot.savingState ? "Saving..." : "Retry saving wallet state"}
+          </button>
+        </div>
+      </div>
+    {/if}
+
+    {#if relayReceipt && !snapshot?.savingState && !snapshot?.persistFailure}
+      <section
+        class="lt-callout lt-callout-success lt-stack lt-screen-only"
+        role="status"
+        data-testid="relay-receipt-panel"
+      >
+        <div class="lt-sync-row">
+          <span class="lt-callout-title">Transaction broadcast &amp; wallet state saved</span>
+          <span class="lt-tx-badge lt-tx-pending" data-testid="relay-receipt-status">
+            Pending in mempool
+          </span>
+        </div>
+        <p class="lt-compact">
+          Relayed via <span class="lt-hash-short"><bdi>{relayReceipt.nodeHost}</bdi></span> at
+          <span class="lt-num" data-testid="relay-receipt-timestamp">
+            {new Date(relayReceipt.relayedAt).toISOString()}
+          </span>
+        </p>
+        <div class="lt-stack">
+          {#each relayReceipt.txHashes as hash (hash)}
+            <code class="lt-hash" data-testid="relay-receipt-txid"><bdi>{hash}</bdi></code>
+          {/each}
+        </div>
+        <div class="lt-form-actions">
+          <button
+            type="button"
+            class="lt-btn lt-btn-secondary"
+            onclick={() => (relayReceipt = null)}
+            data-testid="dismiss-receipt-btn"
+          >
+            Dismiss
+          </button>
+        </div>
+      </section>
     {/if}
 
     {#if !snapshot}
@@ -260,6 +436,29 @@
           {...(onRequestOriginPermission ? { onGrantPermission: handleGrantNodePermission } : {})}
         />
 
+        {#if snapshot.pendingTx}
+          <TxReviewPanel
+            pendingTx={snapshot.pendingTx}
+            daemonHeight={Math.max(
+              snapshot.sync.daemonHeight,
+              snapshot.sync.walletHeight,
+              snapshot.reserve?.height ?? 0
+            )}
+            busy={txFlowBusy || snapshot.savingState}
+            errorMessage={txFlowError}
+            onConfirmRelay={handleConfirmRelay}
+            onDiscard={handleDiscardPrepared}
+          />
+        {:else if txFlowError}
+          <div
+            class="lt-alert lt-alert-danger"
+            role="alert"
+            data-testid="tx-flow-error-banner"
+          >
+            <div class="lt-alert-body"><bdi>{txFlowError}</bdi></div>
+          </div>
+        {/if}
+
         <div class="lt-tabs">
           <div class="lt-tablist" role="tablist" aria-label="Wallet sections">
             <button
@@ -271,6 +470,26 @@
               data-testid="tab-overview"
             >
               Overview
+            </button>
+            <button
+              type="button"
+              role="tab"
+              class="lt-tab"
+              aria-selected={activeTab === "send"}
+              onclick={() => (activeTab = "send")}
+              data-testid="tab-send"
+            >
+              Send
+            </button>
+            <button
+              type="button"
+              role="tab"
+              class="lt-tab"
+              aria-selected={activeTab === "convert"}
+              onclick={() => (activeTab = "convert")}
+              data-testid="tab-convert"
+            >
+              Convert
             </button>
             <button
               type="button"
@@ -365,6 +584,37 @@
 
                 <AddressChunks address={snapshot.activeWallet.primaryAddress} />
               </section>
+            </div>
+          {:else if activeTab === "send"}
+            <div class="lt-tabpanel" role="tabpanel">
+              <SendView
+                {client}
+                balances={snapshot.balances}
+                nodeHost={snapshot.sync.nodeHost}
+                viewOnly={snapshot.activeWallet.viewOnly}
+                disabled={txFlowBusy || snapshot.savingState || snapshot.pendingTx !== null}
+                onPrepared={handlePrepared}
+              />
+            </div>
+          {:else if activeTab === "convert"}
+            <div class="lt-tabpanel" role="tabpanel">
+              <ConvertView
+                {client}
+                balances={snapshot.balances}
+                reserve={snapshot.reserve}
+                daemonHeight={Math.max(
+                  snapshot.sync.daemonHeight,
+                  snapshot.sync.walletHeight,
+                  snapshot.reserve?.height ?? 0
+                )}
+                primaryAddress={snapshot.activeWallet.primaryAddress}
+                nodeHost={snapshot.sync.nodeHost}
+                viewOnly={snapshot.activeWallet.viewOnly}
+                disabled={txFlowBusy || snapshot.savingState || snapshot.pendingTx !== null}
+                {reserveBusy}
+                onRefreshReserve={handleRefreshReserve}
+                onPrepared={handlePrepared}
+              />
             </div>
           {:else if activeTab === "receive"}
             <div class="lt-tabpanel" role="tabpanel">

@@ -159,9 +159,14 @@ async function handleRequest(req: EngineRequest): Promise<EngineResponse> {
     req.type === "SET_SUBADDRESS_LABEL" ||
     req.type === "GET_HISTORY" ||
     req.type === "REFRESH_POOL" ||
-    req.type === "EXPORT_TX_PROOF"
+    req.type === "EXPORT_TX_PROOF" ||
+    req.type === "PREPARE_TRANSFER" ||
+    req.type === "PREPARE_SWEEP" ||
+    req.type === "PREPARE_CONVERSION" ||
+    req.type === "RELAY_PREPARED"
   ) {
     if (walletUnlocked) await resetAutoLockAlarm();
+    updateKeepAlive(walletUnlocked || host.isBusy());
     return res;
   }
 
@@ -227,6 +232,14 @@ chrome.runtime.onConnect.addListener((port) => {
     });
     port.onDisconnect.addListener(() => {
       uiPorts.delete(port);
+      if (uiPorts.size === 0 && walletUnlocked && !host.isSavingOrRelayCritical()) {
+        void host
+          .handleRequest({
+            id: `disconnect-release-${Date.now()}`,
+            type: "RELEASE_PREPARED"
+          })
+          .catch(() => {});
+      }
       updateKeepAlive(walletUnlocked || host.isBusy());
     });
     return;
@@ -237,5 +250,9 @@ chrome.runtime.onConnect.addListener((port) => {
 
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name !== AUTO_LOCK_ALARM) return;
+  if (host.isBusy() || host.isSavingOrRelayCritical()) {
+    void resetAutoLockAlarm();
+    return;
+  }
   void handleRequest({ id: `alarm-${Date.now()}`, type: "LOCK_WALLET" });
 });

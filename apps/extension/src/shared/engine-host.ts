@@ -1,4 +1,5 @@
 import {
+  TxFlowError,
   VaultAuthError,
   WalletEngine,
   type EngineRequest,
@@ -42,7 +43,11 @@ export class ExtensionEngineHost {
   }
 
   isBusy(): boolean {
-    return this.activeOps > 0 || this.syncBusy;
+    return this.activeOps > 0 || this.syncBusy || this.engine.isSavingOrRelayCritical();
+  }
+
+  isSavingOrRelayCritical(): boolean {
+    return this.engine.isSavingOrRelayCritical();
   }
 
   private emitBusy(): void {
@@ -185,6 +190,56 @@ export class ExtensionEngineHost {
           );
           return { id: req.id, ok: true, result };
         }
+        case "PREPARE_TRANSFER": {
+          const result = await this.trackOp(() =>
+            this.engine.prepareTransfer({
+              asset: req.asset,
+              destinations: req.destinations,
+              ...(req.priority ? { priority: req.priority } : {})
+            })
+          );
+          return { id: req.id, ok: true, result };
+        }
+        case "PREPARE_SWEEP": {
+          const result = await this.trackOp(() =>
+            this.engine.prepareSweep({
+              asset: req.asset,
+              address: req.address,
+              ...(req.priority ? { priority: req.priority } : {})
+            })
+          );
+          return { id: req.id, ok: true, result };
+        }
+        case "PREPARE_CONVERSION": {
+          const result = await this.trackOp(() =>
+            this.engine.prepareConversion({
+              sourceAsset: req.sourceAsset,
+              destinationAsset: req.destinationAsset,
+              amount: req.amount,
+              ...(req.address ? { address: req.address } : {}),
+              ...(req.priority ? { priority: req.priority } : {})
+            })
+          );
+          return { id: req.id, ok: true, result };
+        }
+        case "RELAY_PREPARED": {
+          const result = await this.trackOp(() => this.engine.relayPrepared(req.token));
+          return { id: req.id, ok: true, result };
+        }
+        case "DISCARD_PREPARED": {
+          const result = await this.trackOp(() =>
+            this.engine.discardPrepared(req.token, req.verify ?? false)
+          );
+          return { id: req.id, ok: true, result };
+        }
+        case "RETRY_PERSIST": {
+          const result = await this.trackOp(() => this.engine.retryPersist());
+          return { id: req.id, ok: true, result };
+        }
+        case "RELEASE_PREPARED": {
+          const result = await this.trackOp(() => this.engine.releasePrepared());
+          return { id: req.id, ok: true, result };
+        }
         case "GET_DIAGNOSTICS":
         case "GET_PREFS":
         case "UPDATE_PREFS": {
@@ -206,6 +261,16 @@ export class ExtensionEngineHost {
           error: {
             code: err.code,
             message: "Incorrect vault password"
+          }
+        };
+      }
+      if (err instanceof TxFlowError) {
+        return {
+          id: req.id,
+          ok: false,
+          error: {
+            code: err.code,
+            message: err.message
           }
         };
       }

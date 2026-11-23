@@ -114,6 +114,11 @@ export class ReserveService {
     return this.lastStatus;
   }
 
+  seedCachedForTest(status: ReserveStatusDto | null): void {
+    this.lastStatus = status;
+    this.lastKnownHeight = status?.height ?? 0;
+  }
+
   async refreshFromWalletAndNode(
     wallet: ZephyrWallet,
     nodeUrl: string
