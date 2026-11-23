@@ -40,7 +40,7 @@
     type="password"
     bind:value={password}
     autocomplete="new-password"
-    minlength="8"
+    minlength="10"
     required
     {disabled}
     data-testid={`${idPrefix}-password`}
@@ -50,7 +50,7 @@
       <span class={badgeClass} data-testid={`${idPrefix}-strength`}>{strength.label}</span>
     </div>
   {:else}
-    <p class="lt-help">At least 8 characters (12+ characters recommended).</p>
+    <p class="lt-help">At least 10 characters with character variety (12+ characters recommended).</p>
   {/if}
 </div>
 
@@ -64,7 +64,7 @@
     type="password"
     bind:value={confirmPassword}
     autocomplete="new-password"
-    minlength="8"
+    minlength="10"
     required
     {disabled}
     aria-invalid={mismatch ? "true" : undefined}

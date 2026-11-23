@@ -39,6 +39,7 @@ export function buildManifest(forTarget: ExtensionTarget): Record<string, unknow
   };
 
   if (forTarget === "chrome") {
+    base.minimum_chrome_version = "116";
     base.background = {
       service_worker: "background.js",
       type: "module"
@@ -54,7 +55,10 @@ export function buildManifest(forTarget: ExtensionTarget): Record<string, unknow
     base.browser_specific_settings = {
       gecko: {
         id: "wallet@lateo.dev",
-        strict_min_version: "128.0"
+        strict_min_version: "128.0",
+        data_collection_permissions: {
+          required: ["none"]
+        }
       }
     };
   }

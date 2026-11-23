@@ -203,6 +203,17 @@ export interface PersistFailureDto {
   readonly message: string;
 }
 
+/**
+ * Encrypted marker persisted when a relay ends in an uncertain state so locking
+ * or restarting the extension never lets the user silently rebuild and double-pay.
+ */
+export interface UnresolvedRelayDto {
+  readonly txHashes: readonly string[];
+  readonly recordedAt: number;
+  readonly nodeHost: string;
+  readonly reason: string;
+}
+
 export type RelayOutcomeDto =
   | {
       readonly kind: "relayed";
@@ -210,6 +221,7 @@ export type RelayOutcomeDto =
       readonly relayedAt: number;
       readonly nodeHost: string;
       readonly persisted: true;
+      readonly notRelayed?: boolean;
     }
   | {
       readonly kind: "relayed-unsaved";
@@ -217,6 +229,7 @@ export type RelayOutcomeDto =
       readonly relayedAt: number;
       readonly nodeHost: string;
       readonly message: string;
+      readonly notRelayed?: boolean;
     }
   | {
       readonly kind: "relay-unknown";
@@ -230,6 +243,7 @@ export type RelayOutcomeDto =
       readonly kind: "rejected";
       readonly reason: string;
       readonly message: string;
+      readonly verifyRequired?: boolean;
     }
   | {
       readonly kind: "expired";
@@ -244,6 +258,7 @@ export interface WalletSnapshot {
   readonly savingKind: SavingKind | null;
   readonly pendingTx: PreparedTxDto | null;
   readonly persistFailure: PersistFailureDto | null;
+  readonly unresolvedRelay?: UnresolvedRelayDto | null;
   readonly activeWallet: WalletSummaryDto | null;
   readonly balances: readonly BalanceEntryDto[];
   readonly sync: SyncStatusDto;
@@ -408,7 +423,8 @@ export type EngineRequest =
       readonly verify?: boolean;
     }
   | { readonly id: string; readonly type: "RETRY_PERSIST" }
-  | { readonly id: string; readonly type: "RELEASE_PREPARED" };
+  | { readonly id: string; readonly type: "RELEASE_PREPARED" }
+  | { readonly id: string; readonly type: "CLEAR_UNRESOLVED_RELAY" };
 
 export type EngineRequestPayload =
   EngineRequest extends infer R ? (R extends EngineRequest ? Omit<R, "id"> : never) : never;
@@ -498,6 +514,7 @@ export interface WalletClient {
   relayPrepared(token: string): Promise<RelayOutcomeDto>;
   discardPrepared(token: string, verify?: boolean): Promise<WalletSnapshot>;
   retryPersist(): Promise<WalletSnapshot>;
+  clearUnresolvedRelay?(): Promise<WalletSnapshot>;
   subscribe(listener: (snapshot: WalletSnapshot) => void): () => void;
 }
 
@@ -517,4 +534,5 @@ export type TxFlowErrorCode =
   | "SAVE_PENDING"
   | "TOKEN_UNKNOWN"
   | "BUILD_FAILED"
+  | "VERIFICATION_FAILED"
   | "LOCK_DEFERRED";

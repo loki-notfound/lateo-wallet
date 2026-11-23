@@ -22,6 +22,7 @@ import type {
 } from "../rpc/protocol.js";
 import {
   MAX_TRANSFER_DESTINATIONS,
+  MAX_U64_ATOMIC,
   PREPARED_TX_TTL_MS,
   evaluateConversionGate,
   findConversionPair,
@@ -60,6 +61,8 @@ export interface TxFlowOptions {
   readonly validateAddress: (address: string, network: ZephyrNetwork) => Promise<void>;
   /** Monotonic daemon height (HA replica drift safe). */
   readonly getDaemonHeight: () => number;
+  /** Optional fresh daemon height probe invoked immediately before relaying a conversion. */
+  readonly refreshDaemonHeight?: () => Promise<number | null>;
   readonly getReserve: () => ReserveStatusDto | null;
   readonly getNode: () => { readonly url: string; readonly host: string };
   readonly getUnlockedBalance: (asset: string) => bigint | null;
@@ -70,6 +73,22 @@ export interface TxFlowOptions {
   readonly persistAfterRelay: (txHashes: readonly string[]) => Promise<void>;
   /** Called when a relay that timed out locally is later accepted by the node. */
   readonly onLateRelayAccepted?: (txHashes: readonly string[]) => void;
+  /** Called whenever a relay enters an ambiguous state so the engine can persist a marker. */
+  readonly onRelayUnknown?: (info: {
+    readonly txHashes: readonly string[];
+    readonly nodeHost: string;
+    readonly reason: string;
+  }) => void;
+  /** Called when a retry after an uncertain attempt is rejected (e.g. DOUBLE_SPEND). */
+  readonly onUncertainRejection?: (info: {
+    readonly txHashes: readonly string[];
+    readonly nodeHost: string;
+    readonly reason: string;
+  }) => void;
+  /** Called when a relay completes and is confirmed relayed cleanly. */
+  readonly onRelayConfirmed?: () => void;
+  /** Pause/resume background sync while a build is prepared or relaying. */
+  readonly onSyncPauseChange?: (paused: boolean) => void;
   /** Returns a reason when a new transaction must not be started (e.g. unsaved relay). */
   readonly blockNewTransaction?: () => string | null;
   readonly beforeRelay?: () => Promise<void>;
@@ -97,8 +116,8 @@ interface PendingEntry {
   readonly pricingRecordHeight: number | null;
   readonly daemonHeightAtPrepare: number;
   readonly priority: TxPriorityDto;
-  readonly nodeUrl: string;
-  readonly nodeHost: string;
+  nodeUrl: string;
+  nodeHost: string;
   readonly preparedAt: number;
   readonly expiresAt: number;
   relayAttempts: number;
@@ -214,6 +233,7 @@ export class TxFlowController {
   private viewOnly = false;
   private pending: PendingEntry | null = null;
   private relayInFlight = false;
+  private lateRelaysInFlight = 0;
   private expiryTimer: ReturnType<typeof setTimeout> | null = null;
   private generation = 0;
 
@@ -225,12 +245,18 @@ export class TxFlowController {
     this.relayTimeoutMs = options.relayTimeoutMs ?? DEFAULT_RELAY_TIMEOUT_MS;
   }
 
+  private syncPauseState(): void {
+    this.opts.onSyncPauseChange?.(this.pending !== null || this.isRelayInFlight());
+  }
+
   attach(wallet: TxFlowWallet, network: ZephyrNetwork, viewOnly: boolean): void {
     this.clearPending();
     this.generation++;
+    this.lateRelaysInFlight = 0;
     this.wallet = wallet;
     this.network = network;
     this.viewOnly = viewOnly;
+    this.syncPauseState();
   }
 
   /** Lock / close: void and forget any prepared build immediately. */
@@ -241,6 +267,8 @@ export class TxFlowController {
     this.generation++;
     this.wallet = null;
     this.relayInFlight = false;
+    this.lateRelaysInFlight = 0;
+    this.syncPauseState();
     if (wallet && entry) {
       try {
         await wallet.discardPrepared(entry.coreToken);
@@ -251,7 +279,7 @@ export class TxFlowController {
   }
 
   isRelayInFlight(): boolean {
-    return this.relayInFlight;
+    return this.relayInFlight || this.lateRelaysInFlight > 0;
   }
 
   getPending(): PreparedTxDto | null {
@@ -293,6 +321,7 @@ export class TxFlowController {
       clearTimeout(this.expiryTimer);
       this.expiryTimer = null;
     }
+    this.syncPauseState();
   }
 
   private notify(): void {
@@ -307,7 +336,7 @@ export class TxFlowController {
     if (this.viewOnly || (await wallet.isViewOnly())) {
       throw new TxFlowError("VIEW_ONLY", "View-only wallets cannot sign or send transactions");
     }
-    if (this.relayInFlight || this.pending?.status === "relay-unknown") {
+    if (this.isRelayInFlight() || this.pending?.status === "relay-unknown") {
       throw new TxFlowError(
         "RELAY_PENDING",
         "A previous transaction has an unknown broadcast status — retry it or discard and sync first"
@@ -415,6 +444,7 @@ export class TxFlowController {
     };
     this.clearPending();
     this.pending = full;
+    this.syncPauseState();
     this.expiryTimer = setTimeout(() => {
       this.expiryTimer = null;
       this.checkExpiry();
@@ -423,6 +453,33 @@ export class TxFlowController {
     this.notify();
     if (!dto) throw new TxFlowError("BUILD_FAILED", "Prepared transaction vanished");
     return dto;
+  }
+
+  private destinationsMatchRequested(
+    txs: readonly ZephyrBuiltTx[],
+    requested: readonly { readonly address: string; readonly amount: bigint }[]
+  ): boolean {
+    const expectedByAddr = new Map<string, bigint>();
+    for (const d of requested) {
+      expectedByAddr.set(d.address, (expectedByAddr.get(d.address) ?? 0n) + d.amount);
+    }
+    const builtByAddr = new Map<string, bigint>();
+    for (const t of txs) {
+      if (!Array.isArray(t.destinations) || t.destinations.length === 0) {
+        return false;
+      }
+      for (const d of t.destinations) {
+        if (typeof d.address !== "string" || d.amount <= 0n) {
+          return false;
+        }
+        builtByAddr.set(d.address, (builtByAddr.get(d.address) ?? 0n) + d.amount);
+      }
+    }
+    if (builtByAddr.size !== expectedByAddr.size) return false;
+    for (const [addr, amt] of expectedByAddr) {
+      if (builtByAddr.get(addr) !== amt) return false;
+    }
+    return true;
   }
 
   async prepareTransfer(params: {
@@ -453,6 +510,9 @@ export class TxFlowController {
       destinations.push({ address, amount: amount.atomic });
     }
     const requested = destinations.reduce((sum, d) => sum + d.amount, 0n);
+    if (requested > MAX_U64_ATOMIC) {
+      throw new TxFlowError("INVALID_AMOUNT", "Total transfer amount is out of range");
+    }
     this.assertBalance(asset, requested);
     this.dropReady();
 
@@ -476,11 +536,20 @@ export class TxFlowController {
     const totalAmount = txs.reduce((s, t) => s + t.amount, 0n);
     const totalFee = txs.reduce((s, t) => s + t.fee, 0n);
     const totalDebited = txs.reduce((s, t) => s + t.totalDebited, 0n);
-    // Review invariant: what was built is exactly what was requested
+    // Review invariant: every built destination, asset, fee, and total matches the request
     if (
       txs.length === 0 ||
       totalAmount !== requested ||
-      txs.some((t) => t.sourceAsset !== asset || t.destinationAsset !== asset || t.feeAsset !== asset)
+      totalFee < 0n ||
+      txs.some(
+        (t) =>
+          t.sourceAsset !== asset ||
+          t.destinationAsset !== asset ||
+          t.feeAsset !== asset ||
+          t.fee < 0n ||
+          t.totalDebited !== t.amount + t.fee
+      ) ||
+      !this.destinationsMatchRequested(txs, destinations)
     ) {
       await this.discardQuietly(wallet, prepared.token);
       throw new TxFlowError("BUILD_FAILED", "Built transaction does not match the request");
@@ -530,11 +599,18 @@ export class TxFlowController {
     const build = prepared.build;
     if (
       build.txs.length === 0 ||
+      build.totalAmount <= 0n ||
+      build.totalFee < 0n ||
       build.txs.some(
         (t) =>
           t.sourceAsset !== asset ||
           t.destinationAsset !== asset ||
-          (t.destinations ?? []).some((d) => d.address !== address)
+          t.feeAsset !== asset ||
+          t.fee < 0n ||
+          t.totalDebited !== t.amount + t.fee ||
+          !Array.isArray(t.destinations) ||
+          t.destinations.length === 0 ||
+          t.destinations.some((d) => d.address !== address)
       )
     ) {
       await this.discardQuietly(wallet, prepared.token);
@@ -584,7 +660,12 @@ export class TxFlowController {
         ? await this.validateDestinationAddress(params.address, null)
         : await wallet.getPrimaryAddress();
 
-    const gate = evaluateConversionGate(this.opts.getReserve(), sourceAsset, destinationAsset);
+    const gate = evaluateConversionGate(
+      this.opts.getReserve(),
+      sourceAsset,
+      destinationAsset,
+      this.opts.getDaemonHeight()
+    );
     if (!gate.allowed) {
       throw new TxFlowError("RESERVE_BLOCKED", gate.reason ?? "Conversion pair is blocked");
     }
@@ -615,6 +696,8 @@ export class TxFlowController {
       b.destination.address !== address ||
       b.amountBurnt !== amount.atomic ||
       b.feeAsset !== sourceAsset ||
+      b.fee < 0n ||
+      b.totalDebited !== b.amountBurnt + b.fee ||
       !Number.isSafeInteger(b.pricingRecordHeight) ||
       b.pricingRecordHeight <= 0
     ) {
@@ -661,7 +744,7 @@ export class TxFlowController {
    */
   checkExpiry(): boolean {
     const e = this.pending;
-    if (!e || e.status !== "ready" || this.relayInFlight) return false;
+    if (!e || e.status !== "ready" || this.isRelayInFlight()) return false;
     const ttlExpired = this.now() >= e.expiresAt;
     const pricingExpired =
       e.pricingRecordHeight !== null &&
@@ -691,7 +774,7 @@ export class TxFlowController {
         "This prepared transaction is no longer available — prepare it again"
       );
     }
-    if (this.relayInFlight) {
+    if (this.isRelayInFlight()) {
       throw new TxFlowError("RELAY_PENDING", "A relay for this transaction is already running");
     }
     if (entry.status === "ready" && this.now() >= entry.expiresAt) {
@@ -703,8 +786,28 @@ export class TxFlowController {
       this.notify();
       return out;
     }
-    if (entry.pricingRecordHeight !== null) {
-      const pr = pricingRecordStatus(entry.pricingRecordHeight, this.opts.getDaemonHeight());
+    if (entry.kind === "conversion") {
+      if (
+        entry.pricingRecordHeight === null ||
+        !Number.isSafeInteger(entry.pricingRecordHeight) ||
+        entry.pricingRecordHeight <= 0
+      ) {
+        const out = this.expiredOutcome(
+          entry,
+          "PRICING_RECORD_INVALID",
+          "The conversion pricing record height is invalid — prepare the conversion again"
+        );
+        this.notify();
+        return out;
+      }
+      let daemonHeight = this.opts.getDaemonHeight();
+      if (this.opts.refreshDaemonHeight) {
+        const fresh = await this.opts.refreshDaemonHeight().catch(() => null);
+        if (typeof fresh === "number" && Number.isSafeInteger(fresh) && fresh > daemonHeight) {
+          daemonHeight = fresh;
+        }
+      }
+      const pr = pricingRecordStatus(entry.pricingRecordHeight, daemonHeight);
       if (pr.expired) {
         const out = this.expiredOutcome(
           entry,
@@ -729,10 +832,18 @@ export class TxFlowController {
     }
 
     this.relayInFlight = true;
-    entry.relayAttempts += 1;
+    this.syncPauseState();
     this.notify();
     try {
+      // Run pre-relay checks (host permission, sync idle wait, daemon bind) before consuming an attempt.
       await this.opts.beforeRelay?.();
+      const relayNode = this.opts.getNode();
+      entry.nodeUrl = relayNode.url;
+      entry.nodeHost = relayNode.host;
+      entry.relayAttempts += 1;
+      const relayGeneration = this.generation;
+      this.notify();
+
       type Raced =
         | { readonly t: "ok"; readonly r: ZephyrRelayResult }
         | { readonly t: "err"; readonly e: unknown }
@@ -751,10 +862,27 @@ export class TxFlowController {
       if (timer !== undefined) clearTimeout(timer);
 
       if (raced.t === "timeout") {
-        void relayPromise.then(
-          (r) => this.handleLateResult(entry, r),
-          () => undefined
-        );
+        this.lateRelaysInFlight += 1;
+        this.syncPauseState();
+        void relayPromise
+          .then(
+            (r) => {
+              if (relayGeneration === this.generation && this.wallet === wallet) {
+                this.handleLateResult(entry, r);
+              }
+            },
+            () => undefined
+          )
+          .finally(() => {
+            if (relayGeneration === this.generation) {
+              this.lateRelaysInFlight = Math.max(0, this.lateRelaysInFlight - 1);
+              if (!this.isRelayInFlight()) {
+                this.opts.afterRelay?.();
+              }
+              this.syncPauseState();
+              this.notify();
+            }
+          });
         return this.toRelayUnknown(
           entry,
           "RELAY_TIMEOUT",
@@ -768,7 +896,10 @@ export class TxFlowController {
       return await this.handleRelayResult(entry, raced.r);
     } finally {
       this.relayInFlight = false;
-      this.opts.afterRelay?.();
+      if (!this.isRelayInFlight()) {
+        this.opts.afterRelay?.();
+      }
+      this.syncPauseState();
       this.notify();
     }
   }
@@ -784,6 +915,11 @@ export class TxFlowController {
     if (entry.txs.every((t) => t.outcome === null || t.outcome === "notSent")) {
       entry.txs = entry.txs.map((t) => ({ ...t, outcome: t.outcome ?? "unknown" }));
     }
+    this.opts.onRelayUnknown?.({
+      txHashes: entry.txs.map((t) => t.hash),
+      nodeHost: entry.nodeHost,
+      reason
+    });
     const pending = this.pending === entry ? this.getPending() : null;
     return {
       kind: "relay-unknown",
@@ -811,7 +947,23 @@ export class TxFlowController {
     const diag = we?.diagnostic ?? "";
 
     if (code === "TX_REJECTED") {
+      const hadEarlierUnknown = entry.status === "relay-unknown" || entry.relayAttempts > 1;
+      const hashes = entry.txs.map((t) => t.hash);
+      const nodeHost = entry.nodeHost;
       if (this.pending === entry) this.clearPending();
+      if (hadEarlierUnknown) {
+        const reason = diag || "REJECTED";
+        this.opts.onUncertainRejection?.({ txHashes: hashes, nodeHost, reason });
+        return {
+          kind: "rejected",
+          reason,
+          verifyRequired: true,
+          message:
+            diag === "DOUBLE_SPEND"
+              ? "The node reported inputs already spent on retry — the earlier attempt likely reached the network. Sync the wallet to verify before sending again."
+              : "The node rejected this retry after an earlier uncertain attempt — the earlier attempt may have reached the network. Sync the wallet to verify before sending again."
+        };
+      }
       return {
         kind: "rejected",
         reason: diag || "REJECTED",
@@ -820,7 +972,16 @@ export class TxFlowController {
     }
     if (diag === "RELAY_TOKEN_VOID") {
       const wasUnknown = entry.status === "relay-unknown";
+      const hashes = entry.txs.map((t) => t.hash);
+      const nodeHost = entry.nodeHost;
       if (this.pending === entry) this.clearPending();
+      if (wasUnknown) {
+        this.opts.onUncertainRejection?.({
+          txHashes: hashes,
+          nodeHost,
+          reason: "RELAY_TOKEN_VOID"
+        });
+      }
       return {
         kind: "expired",
         reason: "RELAY_TOKEN_VOID",
@@ -852,6 +1013,7 @@ export class TxFlowController {
     const outcomes = new Map(result.txs.map((t) => [t.hash, t.outcome] as const));
     entry.txs = entry.txs.map((t) => ({ ...t, outcome: outcomes.get(t.hash) ?? t.outcome }));
     const accepted = entry.txs.filter((t) => t.outcome === "accepted").map((t) => t.hash);
+    const anyNotRelayed = result.txs.some((t) => t.outcome === "accepted" && Boolean(t.notRelayed));
     const node = { host: entry.nodeHost };
     const relayedAt = this.now();
 
@@ -876,14 +1038,31 @@ export class TxFlowController {
 
     if (result.complete) {
       if (this.pending === entry) this.clearPending();
+      if (anyNotRelayed) {
+        this.opts.onRelayUnknown?.({
+          txHashes: accepted,
+          nodeHost: node.host,
+          reason: "NOT_RELAYED"
+        });
+      } else {
+        this.opts.onRelayConfirmed?.();
+      }
       return persisted
-        ? { kind: "relayed", txHashes: accepted, relayedAt, nodeHost: node.host, persisted: true }
+        ? {
+            kind: "relayed",
+            txHashes: accepted,
+            relayedAt,
+            nodeHost: node.host,
+            persisted: true,
+            ...(anyNotRelayed ? { notRelayed: true } : {})
+          }
         : {
             kind: "relayed-unsaved",
             txHashes: accepted,
             relayedAt,
             nodeHost: node.host,
-            message: persistMessage
+            message: persistMessage,
+            ...(anyNotRelayed ? { notRelayed: true } : {})
           };
     }
     return this.toRelayUnknown(
@@ -903,30 +1082,40 @@ export class TxFlowController {
     }
     if (result.complete && this.pending === entry) {
       this.clearPending();
+      const anyNotRelayed = result.txs.some((t) => t.outcome === "accepted" && Boolean(t.notRelayed));
+      if (!anyNotRelayed) {
+        this.opts.onRelayConfirmed?.();
+      }
     }
     this.notify();
   }
 
   /** Explicit user discard (also used by "Discard & sync to verify"). */
-  async discard(token: string): Promise<{ readonly wasRelayUnknown: boolean }> {
+  async discard(token: string): Promise<{
+    readonly wasRelayUnknown: boolean;
+    readonly txHashes: readonly string[];
+    readonly nodeHost: string;
+  }> {
     const entry = this.pending;
-    if (!entry) return { wasRelayUnknown: false };
+    if (!entry) return { wasRelayUnknown: false, txHashes: [], nodeHost: "" };
     if (entry.token !== token) {
       throw new TxFlowError("TOKEN_UNKNOWN", "This prepared transaction is no longer available");
     }
-    if (this.relayInFlight) {
+    if (this.isRelayInFlight()) {
       throw new TxFlowError("RELAY_PENDING", "Wait for the running relay to finish");
     }
     const wallet = this.wallet;
+    const txHashes = entry.txs.map((t) => t.hash);
+    const nodeHost = entry.nodeHost;
     this.clearPending();
     if (wallet) await this.discardQuietly(wallet, entry.coreToken);
     this.notify();
-    return { wasRelayUnknown: entry.status === "relay-unknown" };
+    return { wasRelayUnknown: entry.status === "relay-unknown", txHashes, nodeHost };
   }
 
   /** UI gone / node switched: drop a `ready` build, keep a `relay-unknown` one. */
   release(): void {
-    if (this.relayInFlight) return;
+    if (this.isRelayInFlight()) return;
     const had = this.pending?.status === "ready";
     this.dropReady();
     if (had) this.notify();

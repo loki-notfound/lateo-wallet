@@ -18,6 +18,7 @@
   interface Props {
     client: WalletClient;
     prefs: WalletPrefs;
+    activeNodeUrl?: string;
     walletName: string;
     viewOnly: boolean;
     onPrefsUpdated: (next: WalletPrefs) => void;
@@ -29,6 +30,7 @@
   let {
     client,
     prefs,
+    activeNodeUrl,
     walletName,
     viewOnly,
     onPrefsUpdated,
@@ -172,6 +174,7 @@
   <NodeSwitcher
     {client}
     {prefs}
+    {...(activeNodeUrl ? { activeNodeUrl } : {})}
     {onPrefsUpdated}
     onSwitched={onNodeSwitched}
     {...(onRequestOriginPermission ? { onRequestOriginPermission } : {})}

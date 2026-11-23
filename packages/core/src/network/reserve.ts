@@ -34,21 +34,32 @@ export function deriveConversionAvailability(
   readonly conversions: ConversionAvailabilityDto;
   readonly statusSummary: string;
 } {
-  const effectiveLow = Math.min(reserveRatioSpot, reserveRatioMa);
-  const effectiveHigh = Math.max(reserveRatioSpot, reserveRatioMa);
+  const ratiosValid =
+    Number.isFinite(reserveRatioSpot) &&
+    Number.isFinite(reserveRatioMa) &&
+    reserveRatioSpot >= 0 &&
+    reserveRatioMa >= 0;
+  const safeSpot = ratiosValid ? reserveRatioSpot : 0;
+  const safeMa = ratiosValid ? reserveRatioMa : 0;
+  const effectiveLow = Math.min(safeSpot, safeMa);
+  const effectiveHigh = Math.max(safeSpot, safeMa);
 
-  const mintZsd = effectiveLow >= MIN_RATIO_ZSD_MINT;
+  const mintZsd = ratiosValid && effectiveLow >= MIN_RATIO_ZSD_MINT;
   const redeemZsd = zephReserve > 0n;
   const zrsCapActive = numStables >= MIN_ZSD_FOR_ZRS_CAP;
-  const mintZrs = !zrsCapActive || effectiveHigh < MAX_RATIO_ZRS_MINT;
-  const redeemZrs = effectiveLow >= MIN_RATIO_ZSD_MINT;
+  const mintZrs = ratiosValid && (!zrsCapActive || effectiveHigh < MAX_RATIO_ZRS_MINT);
+  const redeemZrs = ratiosValid && effectiveLow >= MIN_RATIO_ZSD_MINT;
   const mintZys = true;
   const redeemZys = true;
 
   let health: ReserveHealthState;
   let statusSummary: string;
 
-  if (!mintZsd) {
+  if (!ratiosValid) {
+    health = "critical";
+    statusSummary =
+      "Reserve ratio data is invalid — ZSD minting, ZRS minting, and ZRS redeeming are paused until a valid reading is received.";
+  } else if (!mintZsd) {
     health = "critical";
     statusSummary =
       "Reserve ratio below 4.0x — ZSD minting and ZRS redeeming are paused; ZRS minting, ZSD redeeming, and ZYS conversions remain open.";
@@ -138,16 +149,16 @@ export class ReserveService {
 
     const spotRatio = Number(reserve.reserveRatio);
     const maRatio = Number(reserve.reserveRatioMa);
-    const safeSpot = Number.isFinite(spotRatio) ? spotRatio : 0;
-    const safeMa = Number.isFinite(maRatio) ? maRatio : 0;
 
     // Monotonic height guard against 1-2 block HA replica lag
-    const monotonicHeight = Math.max(this.lastKnownHeight, header.height);
+    const headerHeight =
+      Number.isSafeInteger(header.height) && header.height >= 0 ? header.height : 0;
+    const monotonicHeight = Math.max(this.lastKnownHeight, headerHeight);
     this.lastKnownHeight = monotonicHeight;
 
     const { health, conversions, statusSummary } = deriveConversionAvailability(
-      safeSpot,
-      safeMa,
+      spotRatio,
+      maRatio,
       reserve.numStables,
       reserve.zephReserve
     );

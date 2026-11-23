@@ -1,5 +1,9 @@
 export const VAULT_SCHEMA_VERSION = 1 as const;
 export const DEFAULT_PBKDF2_ITERATIONS = 600_000;
+export const MIN_PBKDF2_ITERATIONS = 10_000;
+export const MAX_PBKDF2_ITERATIONS = 2_000_000;
+export const VAULT_SALT_BYTES = 16;
+export const VAULT_IV_BYTES = 12;
 
 export interface Pbkdf2KdfDescriptor {
   readonly alg: "PBKDF2-SHA256";
@@ -21,7 +25,7 @@ export interface EncryptedVaultMetaRecord {
   readonly updatedAt: number;
 }
 
-export type WalletBlobKind = "keys" | "cache";
+export type WalletBlobKind = "keys" | "cache" | "relay";
 
 export interface EncryptedWalletBlobRecord {
   readonly key: `${string}:${WalletBlobKind}`;

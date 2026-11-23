@@ -148,6 +148,29 @@ describe("WalletEngine M1.2 vault lifecycle", () => {
     expect(restoredSeed.activeWallet?.seedBackupVerified).toBe(true);
     expect(restoredSeed.activeWallet?.viewOnly).toBe(false);
 
+    // 7b. Existing-vault guard: create/restore MUST fail when a vault already exists (no silent overwrite)
+    await expect(
+      engine.createWallet({
+        password: "another-vault-password",
+        name: "Overwrite Attempt",
+        network: "mainnet"
+      })
+    ).rejects.toThrow(/already exists/i);
+    await expect(
+      engine.restoreFromSeed({
+        password: "another-vault-password",
+        name: "Overwrite Seed",
+        seed: created.seed,
+        restoreHeight: 900_000,
+        network: "mainnet"
+      })
+    ).rejects.toThrow(/already exists/i);
+    // Active session remains intact after rejected overwrite attempts
+    expect((await engine.getSnapshot()).activeWallet?.primaryAddress).toBe(primaryAddress);
+
+    // Explicit reset required before restoring another wallet
+    await engine.resetVault();
+
     // 8. Restore view-only wallet from primaryAddress + privateViewKey
     const restoredViewOnly = await engine.restoreViewOnly({
       password: "view-only-password",

@@ -9,12 +9,16 @@ import {
 } from "./seed-quiz.js";
 
 describe("password strength evaluation", () => {
-  it("enforces minimum length and scores strength tiers", () => {
+  it("enforces minimum length and rejects weak passwords while scoring fair and strong tiers", () => {
     expect(evaluatePasswordStrength("short").valid).toBe(false);
     expect(evaluatePasswordStrength("short").level).toBe("too-short");
-    expect(evaluatePasswordStrength("abcdefgh").level).toBe("weak");
-    expect(evaluatePasswordStrength("Abcdef12").level).toBe("fair");
+    expect(evaluatePasswordStrength("abcdefgh").level).toBe("too-short");
+    expect(evaluatePasswordStrength("abcdefghij").level).toBe("weak");
+    expect(evaluatePasswordStrength("abcdefghij").valid).toBe(false);
+    expect(evaluatePasswordStrength("Abcdef1234").level).toBe("fair");
+    expect(evaluatePasswordStrength("Abcdef1234").valid).toBe(true);
     expect(evaluatePasswordStrength("Correct-Horse-42!").level).toBe("strong");
+    expect(evaluatePasswordStrength("Correct-Horse-42!").valid).toBe(true);
   });
 });
 

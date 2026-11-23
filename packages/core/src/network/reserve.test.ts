@@ -102,4 +102,51 @@ describe("ReserveService & protocol conversion gating", () => {
     const second = await service.refreshWithFetcher(fetcher);
     expect(second.height).toBe(910_005);
   });
+
+  it("enforces exact 4.0x / 8.0x boundaries, spot vs MA divergence, 100-ZSD cap, zero reserve, and non-finite guards", () => {
+    const aboveCapZsd = 100n * 1_000_000_000_000n;
+    const belowCapZsd = 99n * 1_000_000_000_000n;
+    const reserve = 1_000_000_000_000n;
+
+    // Exact 4.0 boundary is allowed; 3.9999 is blocked
+    expect(deriveConversionAvailability(4.0, 4.0, aboveCapZsd, reserve).conversions).toMatchObject({
+      mintZsd: true,
+      redeemZrs: true,
+      mintZrs: true
+    });
+    expect(deriveConversionAvailability(3.9999, 4.5, aboveCapZsd, reserve).conversions).toMatchObject({
+      mintZsd: false,
+      redeemZrs: false,
+      mintZrs: true
+    });
+    // Opposite sides of 4.0 (spot high, MA low) must block via min(spot, ma)
+    expect(deriveConversionAvailability(5.0, 3.9, aboveCapZsd, reserve).conversions).toMatchObject({
+      mintZsd: false,
+      redeemZrs: false
+    });
+
+    // Exact 8.0 boundary is capped when numStables >= 100 ZSD; 7.9999 is open
+    expect(deriveConversionAvailability(8.0, 8.0, aboveCapZsd, reserve).conversions.mintZrs).toBe(false);
+    expect(deriveConversionAvailability(7.9999, 7.9999, aboveCapZsd, reserve).conversions.mintZrs).toBe(true);
+    // Opposite sides of 8.0 (spot < 8, MA >= 8) must cap via max(spot, ma)
+    expect(deriveConversionAvailability(7.5, 8.0, aboveCapZsd, reserve).conversions.mintZrs).toBe(false);
+    // Fewer than 100 ZSD in circulation lifts the 8.0x ZRS mint cap
+    expect(deriveConversionAvailability(10.0, 10.0, belowCapZsd, reserve).conversions.mintZrs).toBe(true);
+
+    // Zero ZEPH reserve blocks ZSD redemption
+    expect(deriveConversionAvailability(5.0, 5.0, aboveCapZsd, 0n).conversions.redeemZsd).toBe(false);
+
+    // Non-finite or negative ratios fail closed
+    const nanState = deriveConversionAvailability(Number.NaN, 5.0, aboveCapZsd, reserve);
+    expect(nanState.health).toBe("critical");
+    expect(nanState.conversions).toMatchObject({
+      mintZsd: false,
+      mintZrs: false,
+      redeemZrs: false
+    });
+    const infState = deriveConversionAvailability(Number.POSITIVE_INFINITY, 5.0, aboveCapZsd, reserve);
+    expect(infState.health).toBe("critical");
+    expect(infState.conversions.mintZsd).toBe(false);
+    expect(infState.conversions.mintZrs).toBe(false);
+  });
 });

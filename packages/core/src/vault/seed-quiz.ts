@@ -39,9 +39,12 @@ export function pickSeedQuizIndices(
       return buf[0]!;
     });
 
+  const limit = Math.floor(0x1_0000_0000 / wordCount) * wordCount;
   const picked = new Set<number>();
   while (picked.size < count) {
-    picked.add((draw() % wordCount) + 1);
+    const sample = draw() >>> 0;
+    if (sample >= limit) continue;
+    picked.add((sample % wordCount) + 1);
   }
   return Array.from(picked).sort((a, b) => a - b);
 }

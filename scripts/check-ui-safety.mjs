@@ -14,6 +14,12 @@ import fs from "node:fs";
 import path from "node:path";
 
 const ROOTS = ["packages/ui/src", "apps/extension/src"];
+const EXTRA_FILES = [
+  "apps/extension/popup.html",
+  "apps/extension/panel.html",
+  "apps/extension/app.html",
+  "apps/extension/offscreen.html"
+];
 const EXTENSIONS = new Set([".svelte", ".ts", ".js", ".html"]);
 
 const RULES = [
@@ -68,7 +74,7 @@ const RULES = [
   {
     name: "no-svelte4-on-directive",
     files: [".svelte"],
-    pattern: /\bon:[a-z]+=/g,
+    pattern: /\bon:[a-zA-Z0-9_|-]+=/g,
     message: "Legacy Svelte 4 'on:event=' directive is forbidden; use Svelte 5 'onevent=' props"
   }
 ];
@@ -84,7 +90,15 @@ function walk(dir, out = []) {
 }
 
 let failures = 0;
-const files = ROOTS.flatMap((r) => walk(r));
+const files = [
+  ...ROOTS.flatMap((r) => walk(r)),
+  ...EXTRA_FILES.filter((f) => fs.existsSync(f))
+];
+
+if (files.length === 0) {
+  console.error("UI-SAFETY [no-files] No source files were found to audit");
+  process.exit(1);
+}
 
 for (const file of files) {
   const ext = path.extname(file);

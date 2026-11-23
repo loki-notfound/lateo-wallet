@@ -65,11 +65,16 @@ function crc32(buf) {
   return (crc ^ 0xffffffff) >>> 0;
 }
 
+const ALLOWED_EXTENSIONS = new Set([".html", ".js", ".css", ".json", ".wasm", ".png", ".svg"]);
+
 function collectFilesSorted(baseDir, currentDir = baseDir, out = []) {
   const entries = fs.readdirSync(currentDir, { withFileTypes: true });
   for (const entry of entries) {
     if (entry.name === ".DS_Store") continue;
     const fullPath = path.join(currentDir, entry.name);
+    if (entry.name.startsWith(".")) {
+      throw new Error(`Refusing to package hidden dotfile/directory: ${fullPath}`);
+    }
     if (entry.isSymbolicLink()) {
       throw new Error(`Refusing to package symbolic link: ${fullPath}`);
     }
@@ -78,6 +83,10 @@ function collectFilesSorted(baseDir, currentDir = baseDir, out = []) {
     } else if (entry.isFile()) {
       if (entry.name.endsWith(".map")) {
         throw new Error(`Refusing to package sourcemap file: ${fullPath}`);
+      }
+      const ext = path.extname(entry.name).toLowerCase();
+      if (!ALLOWED_EXTENSIONS.has(ext)) {
+        throw new Error(`Refusing to package unexpected file extension "${ext}": ${fullPath}`);
       }
       const relPath = path.relative(baseDir, fullPath).split(path.sep).join("/");
       out.push({ relPath, fullPath });

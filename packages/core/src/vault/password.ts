@@ -1,4 +1,4 @@
-export const MIN_VAULT_PASSWORD_LENGTH = 8;
+export const MIN_VAULT_PASSWORD_LENGTH = 10;
 
 export type PasswordStrengthLevel = "too-short" | "weak" | "fair" | "strong";
 
@@ -30,5 +30,9 @@ export function evaluatePasswordStrength(password: string): PasswordStrengthResu
   if (score >= 2) {
     return { level: "fair", label: "Fair password (12+ chars recommended)", valid: true };
   }
-  return { level: "weak", label: "Weak password (add length or variety)", valid: true };
+  return {
+    level: "weak",
+    label: "Weak password — use 12+ characters or mix character types",
+    valid: false
+  };
 }

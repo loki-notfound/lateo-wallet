@@ -12,7 +12,13 @@ import {
   toBase64,
   zeroize
 } from "./crypto.js";
-import { VAULT_SCHEMA_VERSION, type VaultManifestPlaintext } from "./types.js";
+import { evaluatePasswordStrength } from "./password.js";
+import {
+  MAX_PBKDF2_ITERATIONS,
+  MIN_PBKDF2_ITERATIONS,
+  VAULT_SCHEMA_VERSION,
+  type VaultManifestPlaintext
+} from "./types.js";
 
 const FAST_TEST_ITERATIONS = 10_000;
 
@@ -122,5 +128,74 @@ describe("vault WebCrypto envelope (KEK -> vault_meta[DEK + corePassword] -> wal
     const buf = new Uint8Array([1, 2, 3, 4]);
     zeroize(buf);
     expect(buf).toEqual(new Uint8Array([0, 0, 0, 0]));
+  });
+
+  it("enforces KDF bounds, IV/salt length checks, and AAD authentication of KDF and syncedHeight", async () => {
+    const { dekKey, dekBase64 } = await generateDek();
+    const walletId = generateWalletId();
+    const manifest: VaultManifestPlaintext = {
+      schemaVersion: VAULT_SCHEMA_VERSION,
+      dek: dekBase64,
+      wallets: []
+    };
+
+    const { record } = await encryptVaultMeta(manifest, "Strong-Passphrase!2026", {
+      iterations: FAST_TEST_ITERATIONS
+    });
+
+    // Reject out-of-bounds KDF iterations before deriving key
+    await expect(
+      decryptVaultMeta(
+        { ...record, kdf: { ...record.kdf, iterations: MIN_PBKDF2_ITERATIONS - 1 } },
+        "Strong-Passphrase!2026"
+      )
+    ).rejects.toThrow(/out of bounds/i);
+    await expect(
+      decryptVaultMeta(
+        { ...record, kdf: { ...record.kdf, iterations: MAX_PBKDF2_ITERATIONS + 1 } },
+        "Strong-Passphrase!2026"
+      )
+    ).rejects.toThrow(/out of bounds/i);
+
+    // Reject invalid salt or IV lengths
+    await expect(
+      decryptVaultMeta(
+        { ...record, kdf: { ...record.kdf, salt: toBase64(new Uint8Array(8)) } },
+        "Strong-Passphrase!2026"
+      )
+    ).rejects.toThrow(/salt length/i);
+    await expect(
+      decryptVaultMeta(
+        { ...record, iv: toBase64(new Uint8Array(8)) },
+        "Strong-Passphrase!2026"
+      )
+    ).rejects.toThrow(/IV length/i);
+
+    // Reject tampered KDF iterations within bounds (AAD mismatch -> VaultAuthError)
+    await expect(
+      decryptVaultMeta(
+        { ...record, kdf: { ...record.kdf, iterations: FAST_TEST_ITERATIONS + 1 } },
+        "Strong-Passphrase!2026"
+      )
+    ).rejects.toBeInstanceOf(VaultAuthError);
+
+    // Reject tampered blob syncedHeight (AAD mismatch)
+    const blob = await encryptWalletBlob(dekKey, walletId, "cache", new Uint8Array([1, 2, 3]), 500);
+    await expect(
+      decryptWalletBlob(dekKey, { ...blob, syncedHeight: 501 })
+    ).rejects.toThrow();
+
+    // Reject invalid blob IV length
+    await expect(
+      decryptWalletBlob(dekKey, { ...blob, iv: toBase64(new Uint8Array(4)) })
+    ).rejects.toThrow(/IV length/i);
+  });
+
+  it("rejects short or weak passwords and accepts fair/strong passwords", () => {
+    expect(evaluatePasswordStrength("short1!").valid).toBe(false);
+    expect(evaluatePasswordStrength("password12").valid).toBe(false); // 10 chars, only lower+digit (score 1 -> weak)
+    expect(evaluatePasswordStrength("aaaaaaaaaa").valid).toBe(false);
+    expect(evaluatePasswordStrength("initial-vault-password").valid).toBe(true);
+    expect(evaluatePasswordStrength("StrongPass!2026").valid).toBe(true);
   });
 });

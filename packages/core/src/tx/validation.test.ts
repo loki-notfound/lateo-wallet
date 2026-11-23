@@ -216,4 +216,38 @@ describe("M1.4 transaction and conversion validation", () => {
     ).toBe(true);
     expect(looksLikeZephyrAddress("not-an-address")).toBe(false);
   });
+
+  it("enforces u64 bounds, leading/trailing zeros, stale reserve gating, and non-finite pricing record fail-closed", () => {
+    // u64 boundary (18446744.073709551615 allowed; +1 atomic rejected)
+    expect(validateTransferAmount("18446744.073709551615")).toEqual({
+      ok: true,
+      atomic: 18_446_744_073_709_551_615n
+    });
+    expect(validateTransferAmount("18446744.073709551616").ok).toBe(false);
+
+    // Leading and trailing zeros
+    expect(validateTransferAmount("001.500000000000")).toEqual({
+      ok: true,
+      atomic: 1_500_000_000_000n
+    });
+    expect(validateConversionAmount("002.2500")).toEqual({
+      ok: true,
+      atomic: 2_250_000_000_000n
+    });
+    expect(validateConversionAmount("2.25000").ok).toBe(false);
+
+    // Non-finite / non-positive heights fail closed as expired
+    expect(pricingRecordStatus(Number.NaN, 913_600).expired).toBe(true);
+    expect(pricingRecordStatus(913_600, Number.NaN).expired).toBe(true);
+    expect(pricingRecordStatus(0, 913_600).expired).toBe(true);
+    expect(pricingRecordStatus(-1, 913_600).expired).toBe(true);
+    expect(pricingRecordStatus(Number.POSITIVE_INFINITY, 913_600).expired).toBe(true);
+
+    // Stale reserve reading blocked when daemon height exceeds reserve height by > 20 blocks
+    const reserve = makeReserve({ height: 913_600 });
+    expect(evaluateConversionGate(reserve, "ZPH", "ZSD", 913_620).allowed).toBe(true);
+    const staleGate = evaluateConversionGate(reserve, "ZPH", "ZSD", 913_621);
+    expect(staleGate.allowed).toBe(false);
+    expect(staleGate.reason).toContain("stale");
+  });
 });

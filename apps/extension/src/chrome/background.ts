@@ -13,24 +13,105 @@ import { ExtensionPrefsStore } from "../shared/prefs-store.js";
 const OFFSCREEN_URL = "offscreen.html";
 const AUTO_LOCK_ALARM = "lateo-idle-autolock";
 const DEFAULT_NODE_ORIGIN = "https://node.lateo.dev/*";
+const ORPHAN_RECONNECT_WAIT_MS = 1_500;
+const ENGINE_PORT_CONNECT_TIMEOUT_MS = 5_000;
+const DEFAULT_ENGINE_CALL_TIMEOUT_MS = 30_000;
+const LONG_ENGINE_CALL_TIMEOUT_MS = 180_000;
+const MAX_AUTO_LOCK_DEFERRALS = 15;
+
+const UNLOCKED_OP_TYPES = new Set<EngineRequest["type"]>([
+  "MARK_SEED_BACKUP_VERIFIED",
+  "CHANGE_VAULT_PASSWORD",
+  "REVEAL_SECRETS",
+  "SYNC_NOW",
+  "REFRESH_RESERVE",
+  "PROBE_NODE",
+  "LIST_SUBADDRESSES",
+  "CREATE_SUBADDRESS",
+  "SET_SUBADDRESS_LABEL",
+  "GET_HISTORY",
+  "REFRESH_POOL",
+  "EXPORT_TX_PROOF",
+  "PREPARE_TRANSFER",
+  "PREPARE_SWEEP",
+  "PREPARE_CONVERSION",
+  "RELAY_PREPARED",
+  "DISCARD_PREPARED",
+  "RETRY_PERSIST",
+  "RELEASE_PREPARED",
+  "CLEAR_UNRESOLVED_RELAY"
+]);
+
+const SNAPSHOT_BROADCAST_TYPES = new Set<EngineRequest["type"]>([
+  "MARK_SEED_BACKUP_VERIFIED",
+  "SYNC_NOW",
+  "DISCARD_PREPARED",
+  "RETRY_PERSIST",
+  "RELEASE_PREPARED",
+  "CLEAR_UNRESOLVED_RELAY"
+]);
+
+const SESSION_START_TYPES = new Set<EngineRequest["type"]>([
+  "CREATE_WALLET",
+  "RESTORE_FROM_SEED",
+  "RESTORE_VIEW_ONLY",
+  "UNLOCK_WALLET"
+]);
+
+const LONG_CALL_TYPES = new Set<EngineRequest["type"]>([
+  "SYNC_NOW",
+  "RELAY_PREPARED",
+  "DISCARD_PREPARED",
+  "CREATE_WALLET",
+  "RESTORE_FROM_SEED",
+  "RESTORE_VIEW_ONLY",
+  "UNLOCK_WALLET",
+  "REFRESH_POOL",
+  "SWITCH_NODE"
+]);
 
 const uiPorts = new Set<chrome.runtime.Port>();
 const idbStore = new IndexedDbVaultStore();
 const prefsStore = new ExtensionPrefsStore();
 
+interface PortWaiter {
+  readonly resolve: (port: chrome.runtime.Port) => void;
+  readonly reject: (err: Error) => void;
+  readonly timer: ReturnType<typeof setTimeout>;
+}
+
+interface PendingEngineCall {
+  readonly originalId: string;
+  readonly resolve: (res: EngineResponse) => void;
+  readonly reject: (err: Error) => void;
+  readonly timer: ReturnType<typeof setTimeout>;
+}
+
 let enginePort: chrome.runtime.Port | null = null;
-let enginePortWaiters: Array<(port: chrome.runtime.Port) => void> = [];
+let enginePortWaiters: PortWaiter[] = [];
 let creatingOffscreen: Promise<void> | null = null;
 let walletUnlocked = false;
 let engineSavingOrCritical = false;
+let engineHasPersistFailure = false;
+let autoLockDeferrals = 0;
 
-const pendingEngineCalls = new Map<
-  string,
-  {
-    readonly resolve: (res: EngineResponse) => void;
-    readonly reject: (err: Error) => void;
+const pendingEngineCalls = new Map<string, PendingEngineCall>();
+
+function generateForwardId(): string {
+  if (typeof globalThis.crypto?.randomUUID === "function") {
+    return globalThis.crypto.randomUUID();
   }
->();
+  const bytes = new Uint8Array(16);
+  globalThis.crypto.getRandomValues(bytes);
+  return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+function updateFlagsFromSnapshot(snap: WalletSnapshot): void {
+  walletUnlocked = !snap.locked;
+  engineHasPersistFailure = snap.persistFailure !== null;
+  engineSavingOrCritical =
+    (snap.savingState && snap.savingKind === "post-relay") || snap.persistFailure !== null;
+}
 
 async function hasOffscreenDocument(): Promise<boolean> {
   const contexts = await chrome.runtime.getContexts({
@@ -40,33 +121,72 @@ async function hasOffscreenDocument(): Promise<boolean> {
   return contexts.length > 0;
 }
 
+function waitForEnginePort(timeoutMs: number): Promise<chrome.runtime.Port> {
+  if (enginePort) return Promise.resolve(enginePort);
+  return new Promise<chrome.runtime.Port>((resolve, reject) => {
+    const waiter: PortWaiter = {
+      resolve: (p) => {
+        clearTimeout(waiter.timer);
+        resolve(p);
+      },
+      reject: (err) => {
+        clearTimeout(waiter.timer);
+        reject(err);
+      },
+      timer: setTimeout(() => {
+        enginePortWaiters = enginePortWaiters.filter((w) => w !== waiter);
+        reject(new Error("Offscreen engine connection timed out"));
+      }, timeoutMs)
+    };
+    enginePortWaiters.push(waiter);
+  });
+}
+
+async function createOffscreenDocumentSingleFlight(): Promise<void> {
+  if (!creatingOffscreen) {
+    creatingOffscreen = chrome.offscreen
+      .createDocument({
+        url: OFFSCREEN_URL,
+        reasons: [chrome.offscreen.Reason.WORKERS],
+        justification: "Run Zephyr WebAssembly wallet engine in a dedicated Web Worker"
+      })
+      .finally(() => {
+        creatingOffscreen = null;
+      });
+  }
+  await creatingOffscreen;
+}
+
 async function ensureOffscreenEnginePort(): Promise<chrome.runtime.Port> {
   if (enginePort) return enginePort;
 
-  const portPromise = new Promise<chrome.runtime.Port>((resolve) => {
-    enginePortWaiters.push(resolve);
-  });
-
-  if (!(await hasOffscreenDocument())) {
-    if (!creatingOffscreen) {
-      creatingOffscreen = chrome.offscreen
-        .createDocument({
-          url: OFFSCREEN_URL,
-          reasons: [chrome.offscreen.Reason.WORKERS],
-          justification: "Run Zephyr WebAssembly wallet engine in a dedicated Web Worker"
-        })
-        .finally(() => {
-          creatingOffscreen = null;
-        });
+  if (await hasOffscreenDocument()) {
+    // Service worker may have restarted while an offscreen document was already open;
+    // give the offscreen reconnect loop a short window to re-attach, otherwise fail closed & recreate.
+    try {
+      return await waitForEnginePort(ORPHAN_RECONNECT_WAIT_MS);
+    } catch {
+      try {
+        await chrome.offscreen.closeDocument();
+      } catch {
+        // Offscreen may already have closed
+      }
+      walletUnlocked = false;
+      engineSavingOrCritical = false;
+      engineHasPersistFailure = false;
     }
-    await creatingOffscreen;
   }
 
-  return enginePort ?? portPromise;
+  const portPromise = waitForEnginePort(ENGINE_PORT_CONNECT_TIMEOUT_MS);
+  await createOffscreenDocumentSingleFlight();
+  return enginePort ?? (await portPromise);
 }
 
 async function closeOffscreenDocument(): Promise<void> {
   walletUnlocked = false;
+  engineSavingOrCritical = false;
+  engineHasPersistFailure = false;
+  autoLockDeferrals = 0;
   if (enginePort) {
     try {
       enginePort.disconnect();
@@ -80,16 +200,29 @@ async function closeOffscreenDocument(): Promise<void> {
   }
 }
 
-async function resetAutoLockAlarm(): Promise<void> {
-  const prefs = await prefsStore.readPrefs();
+async function resetAutoLockAlarm(overrideMinutes?: number): Promise<void> {
+  const delayInMinutes =
+    overrideMinutes !== undefined
+      ? Math.max(1, overrideMinutes)
+      : Math.max(1, (await prefsStore.readPrefs()).autoLockMinutes);
   await chrome.alarms.clear(AUTO_LOCK_ALARM);
-  await chrome.alarms.create(AUTO_LOCK_ALARM, {
-    delayInMinutes: Math.max(1, prefs.autoLockMinutes)
-  });
+  await chrome.alarms.create(AUTO_LOCK_ALARM, { delayInMinutes });
 }
 
-async function clearAutoLockAlarm(): Promise<void> {
-  await chrome.alarms.clear(AUTO_LOCK_ALARM);
+async function resetAutoLockAlarmBestEffort(overrideMinutes?: number): Promise<void> {
+  try {
+    await resetAutoLockAlarm(overrideMinutes);
+  } catch {
+    // Never mask a completed engine operation (such as a relayed tx) on alarm API errors
+  }
+}
+
+async function clearAutoLockAlarmBestEffort(): Promise<void> {
+  try {
+    await chrome.alarms.clear(AUTO_LOCK_ALARM);
+  } catch {
+    // Best-effort alarm clear
+  }
 }
 
 function broadcastEvent(event: EngineEvent): void {
@@ -102,11 +235,56 @@ function broadcastEvent(event: EngineEvent): void {
   }
 }
 
-async function forwardToEngine(req: EngineRequest): Promise<EngineResponse> {
+async function syncInitialNodeToPort(port: chrome.runtime.Port, url?: string): Promise<void> {
+  try {
+    const targetUrl = url ?? (await prefsStore.readPrefs()).activePublicNode;
+    if (targetUrl) {
+      port.postMessage({ type: "INIT_NODE", url: targetUrl });
+    }
+  } catch {
+    // Ignore prefs or disconnect errors
+  }
+}
+
+async function forwardToEngine(
+  req: EngineRequest,
+  opts?: { readonly initNodeUrl?: string }
+): Promise<EngineResponse> {
   const port = await ensureOffscreenEnginePort();
+  if (opts?.initNodeUrl) {
+    await syncInitialNodeToPort(port, opts.initNodeUrl);
+  }
+  const engineReqId = generateForwardId();
+  const timeoutMs = LONG_CALL_TYPES.has(req.type)
+    ? LONG_ENGINE_CALL_TIMEOUT_MS
+    : DEFAULT_ENGINE_CALL_TIMEOUT_MS;
+
   return new Promise<EngineResponse>((resolve, reject) => {
-    pendingEngineCalls.set(req.id, { resolve, reject });
-    port.postMessage(req);
+    const timer = setTimeout(() => {
+      if (!pendingEngineCalls.delete(engineReqId)) return;
+      reject(new Error("Engine request timed out"));
+    }, timeoutMs);
+
+    pendingEngineCalls.set(engineReqId, {
+      originalId: req.id,
+      resolve: (res) => {
+        clearTimeout(timer);
+        resolve({ ...res, id: req.id });
+      },
+      reject: (err) => {
+        clearTimeout(timer);
+        reject(err);
+      },
+      timer
+    });
+
+    try {
+      port.postMessage({ ...req, id: engineReqId });
+    } catch {
+      clearTimeout(timer);
+      pendingEngineCalls.delete(engineReqId);
+      reject(new Error("Offscreen engine disconnected"));
+    }
   });
 }
 
@@ -128,6 +306,7 @@ async function buildLockedSnapshot(): Promise<WalletSnapshot> {
     savingKind: null,
     pendingTx: null,
     persistFailure: null,
+    unresolvedRelay: null,
     activeWallet: null,
     balances: [],
     sync: {
@@ -178,7 +357,7 @@ async function handleUiRequest(req: EngineRequest): Promise<EngineResponse> {
     if (req.type === "UPDATE_PREFS") {
       const updated = await prefsStore.writePrefs(req.patch);
       if (walletUnlocked && req.patch.autoLockMinutes !== undefined) {
-        await resetAutoLockAlarm();
+        await resetAutoLockAlarmBestEffort();
       }
       return { id: req.id, ok: true, result: updated };
     }
@@ -191,7 +370,7 @@ async function handleUiRequest(req: EngineRequest): Promise<EngineResponse> {
       const res = await forwardToEngine(req);
       if (res.ok) {
         const snap = { ...(res.result as WalletSnapshot), offscreenActive: true };
-        walletUnlocked = !snap.locked;
+        updateFlagsFromSnapshot(snap);
         return { id: req.id, ok: true, result: snap };
       }
       return res;
@@ -204,9 +383,8 @@ async function handleUiRequest(req: EngineRequest): Promise<EngineResponse> {
           return res;
         }
       }
-      engineSavingOrCritical = false;
       await closeOffscreenDocument();
-      await clearAutoLockAlarm();
+      await clearAutoLockAlarmBestEffort();
       const lockedSnap = await buildLockedSnapshot();
       broadcastEvent({ type: "SNAPSHOT_UPDATED", snapshot: lockedSnap });
       return { id: req.id, ok: true, result: lockedSnap };
@@ -219,14 +397,29 @@ async function handleUiRequest(req: EngineRequest): Promise<EngineResponse> {
       } else {
         await idbStore.clearAll();
       }
-      await clearAutoLockAlarm();
+      await prefsStore
+        .writePrefs({ activePublicNode: DEFAULT_PUBLIC_NODE_URL, customNodes: [] })
+        .catch(() => {});
+      await clearAutoLockAlarmBestEffort();
       const emptySnap = await buildLockedSnapshot();
       broadcastEvent({ type: "SNAPSHOT_UPDATED", snapshot: emptySnap });
       return { id: req.id, ok: true, result: emptySnap };
     }
 
     if (req.type === "SWITCH_NODE") {
-      const validated = validateNodeUrl(req.url);
+      let validated;
+      try {
+        validated = validateNodeUrl(req.url);
+      } catch (err) {
+        return {
+          id: req.id,
+          ok: false,
+          error: {
+            code: "VALIDATION_ERROR",
+            message: err instanceof Error ? err.message : "Invalid node URL"
+          }
+        };
+      }
       const prefs = await prefsStore.readPrefs();
       const customNodes =
         req.saveAsCustom &&
@@ -241,36 +434,17 @@ async function handleUiRequest(req: EngineRequest): Promise<EngineResponse> {
       }
       const res = await forwardToEngine(req);
       if (res.ok) {
-        await resetAutoLockAlarm();
+        autoLockDeferrals = 0;
+        await resetAutoLockAlarmBestEffort();
         const snap = { ...(res.result as WalletSnapshot), offscreenActive: true };
+        updateFlagsFromSnapshot(snap);
         broadcastEvent({ type: "SNAPSHOT_UPDATED", snapshot: snap });
         return { id: req.id, ok: true, result: snap };
       }
       return res;
     }
 
-    // Operations that require an unlocked session
-    if (
-      req.type === "MARK_SEED_BACKUP_VERIFIED" ||
-      req.type === "CHANGE_VAULT_PASSWORD" ||
-      req.type === "REVEAL_SECRETS" ||
-      req.type === "SYNC_NOW" ||
-      req.type === "REFRESH_RESERVE" ||
-      req.type === "PROBE_NODE" ||
-      req.type === "LIST_SUBADDRESSES" ||
-      req.type === "CREATE_SUBADDRESS" ||
-      req.type === "SET_SUBADDRESS_LABEL" ||
-      req.type === "GET_HISTORY" ||
-      req.type === "REFRESH_POOL" ||
-      req.type === "EXPORT_TX_PROOF" ||
-      req.type === "PREPARE_TRANSFER" ||
-      req.type === "PREPARE_SWEEP" ||
-      req.type === "PREPARE_CONVERSION" ||
-      req.type === "RELAY_PREPARED" ||
-      req.type === "DISCARD_PREPARED" ||
-      req.type === "RETRY_PERSIST" ||
-      req.type === "RELEASE_PREPARED"
-    ) {
+    if (UNLOCKED_OP_TYPES.has(req.type)) {
       if (!(await hasOffscreenDocument())) {
         return {
           id: req.id,
@@ -280,19 +454,11 @@ async function handleUiRequest(req: EngineRequest): Promise<EngineResponse> {
       }
       const res = await forwardToEngine(req);
       if (res.ok) {
-        await resetAutoLockAlarm();
-        if (
-          req.type === "MARK_SEED_BACKUP_VERIFIED" ||
-          req.type === "SYNC_NOW" ||
-          req.type === "DISCARD_PREPARED" ||
-          req.type === "RETRY_PERSIST" ||
-          req.type === "RELEASE_PREPARED"
-        ) {
+        autoLockDeferrals = 0;
+        await resetAutoLockAlarmBestEffort();
+        if (SNAPSHOT_BROADCAST_TYPES.has(req.type)) {
           const snap = { ...(res.result as WalletSnapshot), offscreenActive: true };
-          engineSavingOrCritical =
-            snap.savingState ||
-            snap.persistFailure !== null ||
-            snap.pendingTx?.status === "relay-unknown";
+          updateFlagsFromSnapshot(snap);
           broadcastEvent({ type: "SNAPSHOT_UPDATED", snapshot: snap });
           return { id: req.id, ok: true, result: snap };
         }
@@ -300,49 +466,52 @@ async function handleUiRequest(req: EngineRequest): Promise<EngineResponse> {
       return res;
     }
 
+    if (!SESSION_START_TYPES.has(req.type)) {
+      return {
+        id: req.id,
+        ok: false,
+        error: { code: "UNKNOWN_REQUEST", message: "Unknown request type" }
+      };
+    }
+
     // CREATE_WALLET, RESTORE_FROM_SEED, RESTORE_VIEW_ONLY, UNLOCK_WALLET
-    const wasUnlocked = walletUnlocked;
     const prefs = await prefsStore.readPrefs();
-    const res = await forwardToEngine(req);
+    const res = await forwardToEngine(req, { initNodeUrl: prefs.activePublicNode });
     if (!res.ok) {
-      if (!wasUnlocked) {
-        await closeOffscreenDocument();
+      // Re-check live flags at failure time so a racing wrong password cannot close an unlocked/saving engine.
+      if (!walletUnlocked && !engineSavingOrCritical) {
+        await closeOffscreenDocument().catch(() => {});
       }
       return res;
     }
 
+    autoLockDeferrals = 0;
     walletUnlocked = true;
-    await resetAutoLockAlarm();
-
-    // Ensure configured custom node from prefs is applied on unlock
-    if (prefs.activePublicNode && prefs.activePublicNode !== DEFAULT_PUBLIC_NODE_URL) {
-      void forwardToEngine({
-        id: `init-node-${Date.now()}`,
-        type: "SWITCH_NODE",
-        url: prefs.activePublicNode
-      }).catch(() => {});
-    }
+    await resetAutoLockAlarmBestEffort();
 
     if (req.type === "CREATE_WALLET") {
       const created = res.result as CreateWalletResultDto;
       const snap: WalletSnapshot = { ...created.snapshot, offscreenActive: true };
+      updateFlagsFromSnapshot(snap);
       broadcastEvent({ type: "SNAPSHOT_UPDATED", snapshot: snap });
       return { id: req.id, ok: true, result: { ...created, snapshot: snap } };
     }
 
     const snap: WalletSnapshot = { ...(res.result as WalletSnapshot), offscreenActive: true };
+    updateFlagsFromSnapshot(snap);
     broadcastEvent({ type: "SNAPSHOT_UPDATED", snapshot: snap });
     return { id: req.id, ok: true, result: snap };
   } catch (err) {
-    if (!walletUnlocked) {
+    if (!walletUnlocked && !engineSavingOrCritical) {
       await closeOffscreenDocument().catch(() => {});
     }
+    const isTimeout = err instanceof Error && err.message.includes("timed out");
     return {
       id: req.id,
       ok: false,
       error: {
-        code: "SW_ERROR",
-        message: err instanceof Error ? err.message : "Service worker request failed"
+        code: isTimeout ? "REQUEST_TIMEOUT" : "SW_ERROR",
+        message: isTimeout ? "Wallet engine request timed out" : "Service worker request failed"
       }
     };
   }
@@ -364,8 +533,10 @@ chrome.runtime.onConnect.addListener((port) => {
     }
 
     enginePort = port;
+    void syncInitialNodeToPort(port);
+
     for (const waiter of enginePortWaiters) {
-      waiter(port);
+      waiter.resolve(port);
     }
     enginePortWaiters = [];
 
@@ -399,11 +570,7 @@ chrome.runtime.onConnect.addListener((port) => {
 
       if ("type" in msg && (msg as EngineEvent).type === "SNAPSHOT_UPDATED") {
         const ev = msg as EngineEvent;
-        walletUnlocked = !ev.snapshot.locked;
-        engineSavingOrCritical =
-          ev.snapshot.savingState ||
-          ev.snapshot.persistFailure !== null ||
-          ev.snapshot.pendingTx?.status === "relay-unknown";
+        updateFlagsFromSnapshot(ev.snapshot);
         broadcastEvent({
           type: "SNAPSHOT_UPDATED",
           snapshot: { ...ev.snapshot, offscreenActive: true }
@@ -423,6 +590,8 @@ chrome.runtime.onConnect.addListener((port) => {
     port.onDisconnect.addListener(() => {
       if (enginePort === port) enginePort = null;
       walletUnlocked = false;
+      engineSavingOrCritical = false;
+      engineHasPersistFailure = false;
       for (const [, pending] of pendingEngineCalls) {
         pending.reject(new Error("Offscreen engine disconnected"));
       }
@@ -439,7 +608,16 @@ chrome.runtime.onConnect.addListener((port) => {
 
     uiPorts.add(port);
     port.onMessage.addListener((msg: unknown) => {
-      if (!msg || typeof msg !== "object" || !("type" in msg) || !("id" in msg)) return;
+      if (
+        !msg ||
+        typeof msg !== "object" ||
+        !("type" in msg) ||
+        typeof (msg as { type: unknown }).type !== "string" ||
+        !("id" in msg) ||
+        typeof (msg as { id: unknown }).id !== "string"
+      ) {
+        return;
+      }
       void handleUiRequest(msg as EngineRequest).then((res) => {
         try {
           port.postMessage(res);
@@ -465,9 +643,17 @@ chrome.runtime.onConnect.addListener((port) => {
 
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name !== AUTO_LOCK_ALARM) return;
-  if (engineSavingOrCritical) {
-    void resetAutoLockAlarm();
+  if (engineSavingOrCritical && (engineHasPersistFailure || autoLockDeferrals < MAX_AUTO_LOCK_DEFERRALS)) {
+    autoLockDeferrals += 1;
+    void resetAutoLockAlarmBestEffort(1);
     return;
   }
-  void handleUiRequest({ id: `alarm-${Date.now()}`, type: "LOCK_WALLET" });
+  void handleUiRequest({ id: `alarm-${Date.now()}`, type: "LOCK_WALLET" }).then((res) => {
+    if (!res.ok) {
+      autoLockDeferrals += 1;
+      void resetAutoLockAlarmBestEffort(1);
+    } else {
+      autoLockDeferrals = 0;
+    }
+  });
 });

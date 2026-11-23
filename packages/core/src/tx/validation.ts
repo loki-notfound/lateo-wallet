@@ -12,6 +12,10 @@ export const CONVERSION_MAX_DECIMALS = 4;
 export const CONVERSION_ATOMIC_STEP = 100_000_000n;
 /** A conversion pricing record stays usable for this many blocks above its height. */
 export const PRICING_RECORD_VALIDITY_BLOCKS = 10;
+/** Cached reserve readings older than this many blocks are treated as stale for conversions. */
+export const MAX_RESERVE_STALENESS_BLOCKS = 20;
+/** u64 upper bound for an atomic Zephyr amount or transfer sum. */
+export const MAX_U64_ATOMIC = 18_446_744_073_709_551_615n;
 /** Most destinations a single transfer accepts. */
 export const MAX_TRANSFER_DESTINATIONS = 15;
 /** Wall-clock lifetime of a prepared (not yet relayed) transaction. */
@@ -167,17 +171,33 @@ export interface ConversionGate {
   readonly blockedPairs: readonly string[];
 }
 
-/** Gate a conversion pair on the live reserve status (null reserve = unknown, blocked). */
+/** Gate a conversion pair on the live reserve status (null or stale reserve = blocked). */
 export function evaluateConversionGate(
   reserve: ReserveStatusDto | null,
   source: string,
-  destination: string
+  destination: string,
+  currentDaemonHeight?: number
 ): ConversionGate {
   const pair = findConversionPair(source, destination);
   if (!reserve) {
     return {
       allowed: false,
       reason: "Reserve ratio not loaded yet — refresh the reserve status before converting.",
+      openPairs: [],
+      blockedPairs: CONVERSION_PAIRS.map((p) => p.label)
+    };
+  }
+  if (
+    currentDaemonHeight !== undefined &&
+    Number.isFinite(currentDaemonHeight) &&
+    currentDaemonHeight > 0 &&
+    Number.isFinite(reserve.height) &&
+    reserve.height > 0 &&
+    currentDaemonHeight - reserve.height > MAX_RESERVE_STALENESS_BLOCKS
+  ) {
+    return {
+      allowed: false,
+      reason: `Reserve status is stale (${currentDaemonHeight - reserve.height} blocks behind daemon height) — refresh the reserve status before converting.`,
       openPairs: [],
       blockedPairs: CONVERSION_PAIRS.map((p) => p.label)
     };
@@ -223,6 +243,19 @@ export function pricingRecordStatus(
   pricingRecordHeight: number,
   daemonHeight: number
 ): PricingRecordStatus {
+  if (
+    !Number.isFinite(pricingRecordHeight) ||
+    !Number.isFinite(daemonHeight) ||
+    pricingRecordHeight <= 0 ||
+    daemonHeight < 0
+  ) {
+    return {
+      ageBlocks: PRICING_RECORD_VALIDITY_BLOCKS,
+      blocksRemaining: 0,
+      expired: true,
+      expiresAtHeight: 0
+    };
+  }
   const age = Math.max(0, daemonHeight - pricingRecordHeight);
   const remaining = Math.max(0, PRICING_RECORD_VALIDITY_BLOCKS - age);
   return {

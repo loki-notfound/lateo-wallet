@@ -16,6 +16,7 @@ describe("deterministic MV3 manifest builder", () => {
     expect(chrome.content_scripts).toBeUndefined();
     expect(chrome.side_panel).toEqual({ default_path: "panel.html" });
     expect(chrome.background).toEqual({ service_worker: "background.js", type: "module" });
+    expect(chrome.minimum_chrome_version).toBe("116");
     expect(chrome.content_security_policy).toEqual({ extension_pages: EXTENSION_CSP });
   });
 
@@ -28,7 +29,11 @@ describe("deterministic MV3 manifest builder", () => {
     expect(firefox.side_panel).toBeUndefined();
     expect(firefox.background).toEqual({ scripts: ["background-firefox.js"], type: "module" });
     expect(firefox.browser_specific_settings).toEqual({
-      gecko: { id: "wallet@lateo.dev", strict_min_version: "128.0" }
+      gecko: {
+        id: "wallet@lateo.dev",
+        strict_min_version: "128.0",
+        data_collection_permissions: { required: ["none"] }
+      }
     });
     expect(firefox.content_security_policy).toEqual({ extension_pages: EXTENSION_CSP });
   });

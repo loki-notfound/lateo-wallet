@@ -10,12 +10,20 @@
   interface Props {
     client: WalletClient;
     prefs: WalletPrefs;
+    activeNodeUrl?: string;
     onPrefsUpdated: (next: WalletPrefs) => void;
     onSwitched: (snapshot: WalletSnapshot) => void;
     onRequestOriginPermission?: (originPattern: string) => Promise<boolean>;
   }
 
-  let { client, prefs, onPrefsUpdated, onSwitched, onRequestOriginPermission }: Props = $props();
+  let {
+    client,
+    prefs,
+    activeNodeUrl,
+    onPrefsUpdated,
+    onSwitched,
+    onRequestOriginPermission
+  }: Props = $props();
 
   let customUrlInput = $state("");
   let probeResult = $state<NodeProbeResultDto | null>(null);
@@ -23,10 +31,18 @@
   let errorMsg = $state<string | null>(null);
   let successMsg = $state<string | null>(null);
 
-  const savedNodes = $derived([
-    DEFAULT_PUBLIC_NODE_URL,
-    ...prefs.customNodes.filter((u) => u !== DEFAULT_PUBLIC_NODE_URL)
-  ]);
+  const effectiveActiveNode = $derived(activeNodeUrl ?? prefs.activePublicNode);
+
+  const savedNodes = $derived.by(() => {
+    const list = [
+      DEFAULT_PUBLIC_NODE_URL,
+      ...prefs.customNodes.filter((u) => u !== DEFAULT_PUBLIC_NODE_URL)
+    ];
+    if (effectiveActiveNode && !list.includes(effectiveActiveNode)) {
+      list.push(effectiveActiveNode);
+    }
+    return list;
+  });
 
   async function handleProbe(targetUrl: string): Promise<void> {
     errorMsg = null;
@@ -123,13 +139,13 @@
   <div class="lt-subaddress-list">
     {#each savedNodes as nodeUrl (nodeUrl)}
       <div
-        class={prefs.activePublicNode === nodeUrl
+        class={effectiveActiveNode === nodeUrl
           ? "lt-subaddress-row lt-subaddress-row-active"
           : "lt-subaddress-row"}
       >
         <div class="lt-meta-pills">
           <code><bdi>{nodeUrl}</bdi></code>
-          {#if prefs.activePublicNode === nodeUrl}
+          {#if effectiveActiveNode === nodeUrl}
             <span class="lt-tx-badge lt-tx-confirmed">Active</span>
           {/if}
         </div>
@@ -143,7 +159,7 @@
           >
             Test
           </button>
-          {#if prefs.activePublicNode !== nodeUrl}
+          {#if effectiveActiveNode !== nodeUrl}
             <button
               type="button"
               class="lt-btn lt-btn-primary"

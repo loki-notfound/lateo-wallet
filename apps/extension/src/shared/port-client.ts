@@ -19,16 +19,67 @@ import type {
 } from "@lateo-wallet/core/rpc";
 import type { WalletPrefs } from "@lateo-wallet/core/storage";
 
+const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
+const LONG_REQUEST_TIMEOUT_MS = 180_000;
+const LONG_REQUEST_TYPES = new Set<EngineRequestPayload["type"]>([
+  "SYNC_NOW",
+  "RELAY_PREPARED",
+  "DISCARD_PREPARED",
+  "CREATE_WALLET",
+  "RESTORE_FROM_SEED",
+  "RESTORE_VIEW_ONLY",
+  "UNLOCK_WALLET",
+  "REFRESH_POOL",
+  "SWITCH_NODE"
+]);
+
+export class PortClientError extends Error {
+  readonly code: string;
+
+  constructor(code: string, message: string) {
+    super(message);
+    this.name = "PortClientError";
+    this.code = code;
+  }
+}
+
 type PendingResolver = {
   readonly resolve: (value: unknown) => void;
   readonly reject: (err: Error) => void;
+  readonly timer: ReturnType<typeof setTimeout>;
 };
+
+function makeRequestId(): string {
+  if (typeof globalThis.crypto?.randomUUID === "function") {
+    return globalThis.crypto.randomUUID();
+  }
+  const bytes = new Uint8Array(16);
+  globalThis.crypto.getRandomValues(bytes);
+  return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+}
 
 export class PortWalletClient implements WalletClient {
   private port: chrome.runtime.Port | null = null;
-  private reqCounter = 0;
+  private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private readonly pending = new Map<string, PendingResolver>();
   private readonly listeners = new Set<(snapshot: WalletSnapshot) => void>();
+
+  private scheduleReconnectIfSubscribed(): void {
+    if (this.listeners.size === 0 || this.reconnectTimer !== null) return;
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
+      if (this.listeners.size === 0) return;
+      void this.getSnapshot()
+        .then((snap) => {
+          for (const listener of this.listeners) {
+            listener(snap);
+          }
+        })
+        .catch(() => {
+          // Next user interaction or reconnect cycle will retry
+        });
+    }, 250);
+  }
 
   private ensurePort(): chrome.runtime.Port {
     if (this.port) return this.port;
@@ -47,10 +98,11 @@ export class PortWalletClient implements WalletClient {
         const entry = this.pending.get(res.id);
         if (!entry) return;
         this.pending.delete(res.id);
+        clearTimeout(entry.timer);
         if (res.ok) {
           entry.resolve(res.result);
         } else {
-          entry.reject(new Error(res.error.message));
+          entry.reject(new PortClientError(res.error.code, res.error.message));
         }
       }
     });
@@ -59,23 +111,40 @@ export class PortWalletClient implements WalletClient {
         this.port = null;
       }
       for (const [, entry] of this.pending) {
-        entry.reject(new Error("Engine port disconnected"));
+        clearTimeout(entry.timer);
+        entry.reject(new PortClientError("PORT_DISCONNECTED", "Engine port disconnected"));
       }
       this.pending.clear();
+      this.scheduleReconnectIfSubscribed();
     });
     this.port = port;
     return port;
   }
 
   private request<T>(payload: EngineRequestPayload): Promise<T> {
-    const id = `req-${++this.reqCounter}`;
+    const id = makeRequestId();
     const port = this.ensurePort();
+    const timeoutMs = LONG_REQUEST_TYPES.has(payload.type)
+      ? LONG_REQUEST_TIMEOUT_MS
+      : DEFAULT_REQUEST_TIMEOUT_MS;
     return new Promise<T>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        if (!this.pending.delete(id)) return;
+        reject(new PortClientError("REQUEST_TIMEOUT", "Wallet request timed out"));
+      }, timeoutMs);
       this.pending.set(id, {
         resolve: (value) => resolve(value as T),
-        reject
+        reject,
+        timer
       });
-      port.postMessage({ ...payload, id });
+      try {
+        port.postMessage({ ...payload, id });
+      } catch {
+        this.pending.delete(id);
+        clearTimeout(timer);
+        if (this.port === port) this.port = null;
+        reject(new PortClientError("PORT_DISCONNECTED", "Failed to send request to wallet engine"));
+      }
     });
   }
 
@@ -310,11 +379,21 @@ export class PortWalletClient implements WalletClient {
     });
   }
 
+  clearUnresolvedRelay(): Promise<WalletSnapshot> {
+    return this.request<WalletSnapshot>({
+      type: "CLEAR_UNRESOLVED_RELAY"
+    });
+  }
+
   subscribe(listener: (snapshot: WalletSnapshot) => void): () => void {
     this.listeners.add(listener);
     this.ensurePort();
     return () => {
       this.listeners.delete(listener);
+      if (this.listeners.size === 0 && this.reconnectTimer !== null) {
+        clearTimeout(this.reconnectTimer);
+        this.reconnectTimer = null;
+      }
     };
   }
 }

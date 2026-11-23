@@ -2,6 +2,7 @@ import {
   TxFlowError,
   VaultAuthError,
   WalletEngine,
+  WalletValidationError,
   type EngineRequest,
   type EngineResponse,
   type HostKind,
@@ -48,6 +49,14 @@ export class ExtensionEngineHost {
 
   isSavingOrRelayCritical(): boolean {
     return this.engine.isSavingOrRelayCritical();
+  }
+
+  setInitialNodeUrl(url: string): void {
+    this.engine.setInitialNodeUrl(url);
+  }
+
+  getSnapshot(): Promise<WalletSnapshot> {
+    return this.engine.getSnapshot();
   }
 
   private emitBusy(): void {
@@ -240,6 +249,10 @@ export class ExtensionEngineHost {
           const result = await this.trackOp(() => this.engine.releasePrepared());
           return { id: req.id, ok: true, result };
         }
+        case "CLEAR_UNRESOLVED_RELAY": {
+          const result = await this.trackOp(() => this.engine.clearUnresolvedRelay());
+          return { id: req.id, ok: true, result };
+        }
         case "GET_DIAGNOSTICS":
         case "GET_PREFS":
         case "UPDATE_PREFS": {
@@ -249,6 +262,16 @@ export class ExtensionEngineHost {
             error: {
               code: "UNHANDLED_HOST_CALL",
               message: "Request must be served by the browser background host"
+            }
+          };
+        }
+        default: {
+          return {
+            id: (req as { id?: string }).id ?? "",
+            ok: false,
+            error: {
+              code: "UNKNOWN_REQUEST",
+              message: "Unknown request type"
             }
           };
         }
@@ -274,12 +297,22 @@ export class ExtensionEngineHost {
           }
         };
       }
+      if (err instanceof WalletValidationError) {
+        return {
+          id: req.id,
+          ok: false,
+          error: {
+            code: err.code,
+            message: err.message
+          }
+        };
+      }
       return {
         id: req.id,
         ok: false,
         error: {
           code: "ENGINE_ERROR",
-          message: err instanceof Error ? err.message : "Operation failed"
+          message: "Operation failed"
         }
       };
     }

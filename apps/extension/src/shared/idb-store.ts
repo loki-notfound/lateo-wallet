@@ -27,9 +27,20 @@ function openDb(): Promise<IDBDatabase> {
   });
 }
 
+function openStrictTx(
+  db: IDBDatabase,
+  storeNames: string | string[],
+  mode: IDBTransactionMode
+): IDBTransaction {
+  if (mode === "readwrite") {
+    return db.transaction(storeNames, mode, { durability: "strict" });
+  }
+  return db.transaction(storeNames, mode);
+}
+
 /**
  * Execute an IndexedDB request and resolve ONLY when the transaction commits
- * (`tx.oncomplete`) so readwrite operations are durable before returning.
+ * (`tx.oncomplete`) with strict durability so readwrite operations survive power loss.
  */
 function runTx<T>(
   storeName: string,
@@ -48,7 +59,7 @@ function runTx<T>(
           reject(err instanceof Error ? err : new Error("IndexedDB transaction failed"));
         };
 
-        const tx = db.transaction(storeName, mode);
+        const tx = openStrictTx(db, storeName, mode);
         const store = tx.objectStore(storeName);
         const req = fn(store);
         req.onsuccess = () => {
@@ -102,7 +113,7 @@ export class IndexedDbVaultStore implements VaultBlobStore {
         reject(err instanceof Error ? err : new Error("Atomic wallet blobs write failed"));
       };
 
-      const tx = db.transaction(STORE_BLOBS, "readwrite");
+      const tx = openStrictTx(db, STORE_BLOBS, "readwrite");
       const blobStore = tx.objectStore(STORE_BLOBS);
       for (const blob of blobs) {
         blobStore.put(blob);
@@ -133,7 +144,7 @@ export class IndexedDbVaultStore implements VaultBlobStore {
         reject(err instanceof Error ? err : new Error("Atomic vault write failed"));
       };
 
-      const tx = db.transaction([STORE_BLOBS, STORE_META], "readwrite");
+      const tx = openStrictTx(db, [STORE_BLOBS, STORE_META], "readwrite");
       const blobStore = tx.objectStore(STORE_BLOBS);
       const metaStore = tx.objectStore(STORE_META);
 
@@ -164,10 +175,11 @@ export class IndexedDbVaultStore implements VaultBlobStore {
         reject(err instanceof Error ? err : new Error("Delete wallet blobs failed"));
       };
 
-      const tx = db.transaction(STORE_BLOBS, "readwrite");
+      const tx = openStrictTx(db, STORE_BLOBS, "readwrite");
       const store = tx.objectStore(STORE_BLOBS);
       store.delete(`${walletId}:keys`);
       store.delete(`${walletId}:cache`);
+      store.delete(`${walletId}:relay`);
 
       tx.oncomplete = () => {
         if (settled) return;
@@ -191,7 +203,7 @@ export class IndexedDbVaultStore implements VaultBlobStore {
         reject(err instanceof Error ? err : new Error("Clear vault failed"));
       };
 
-      const tx = db.transaction([STORE_META, STORE_BLOBS], "readwrite");
+      const tx = openStrictTx(db, [STORE_META, STORE_BLOBS], "readwrite");
       tx.objectStore(STORE_META).clear();
       tx.objectStore(STORE_BLOBS).clear();
 

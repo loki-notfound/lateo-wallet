@@ -88,8 +88,11 @@ export function formatAtomicParts(
  * Parse a non-negative decimal string (up to 12 fractional digits) into atomic BigInt units.
  */
 export function parseAtomicAmount(input: string): bigint {
+  if (typeof input !== "string") {
+    throw new RangeError("Invalid decimal amount");
+  }
   const trimmed = input.trim();
-  if (!/^\d+(\.\d{1,12})?$/.test(trimmed)) {
+  if (trimmed.length === 0 || trimmed.length > 64 || !/^\d+(\.\d{1,12})?$/.test(trimmed)) {
     throw new RangeError("Invalid decimal amount");
   }
   const [wholePart = "0", fracPart = ""] = trimmed.split(".");

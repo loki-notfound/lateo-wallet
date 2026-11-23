@@ -13,14 +13,14 @@ describe("node URL validation", () => {
 
     const withPath = validateNodeUrl("https://example.org:17767/rpc/");
     expect(withPath.url).toBe("https://example.org:17767/rpc");
-    expect(withPath.originPattern).toBe("https://example.org:17767/*");
+    expect(withPath.originPattern).toBe("https://example.org/*");
     expect(withPath.isLocal).toBe(false);
   });
 
   it("allows plain HTTP only for localhost and 127.0.0.1", () => {
     const localIp = validateNodeUrl("http://127.0.0.1:17767");
     expect(localIp.isLocal).toBe(true);
-    expect(localIp.originPattern).toBe("http://127.0.0.1:17767/*");
+    expect(localIp.originPattern).toBe("http://127.0.0.1/*");
 
     const localName = validateNodeUrl("http://localhost:17767/");
     expect(localName.isLocal).toBe(true);

@@ -41,6 +41,10 @@ const EXPECTED_OPTIONAL_HOST_PERMISSIONS = [
   "http://127.0.0.1/*",
   "http://localhost/*"
 ];
+const EXPECTED_EXTENSION_CSP =
+  "default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; worker-src 'self'; style-src 'self'; img-src 'self'; connect-src 'self' https://node.lateo.dev https: http://127.0.0.1:* http://localhost:*; object-src 'none'; base-uri 'none'; form-action 'none';";
+const EXPECTED_UI_META_CSP =
+  "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none';";
 
 const FORBIDDEN_MANIFEST_KEYS = [
   "content_scripts",
@@ -199,10 +203,45 @@ function auditManifest(target, distDir) {
     );
   }
 
+  if (
+    manifest.optional_permissions !== undefined &&
+    (!Array.isArray(manifest.optional_permissions) || manifest.optional_permissions.length > 0)
+  ) {
+    fail(
+      "manifest-permissions",
+      `${target}: unexpected optional_permissions present: ${JSON.stringify(
+        manifest.optional_permissions
+      )}`
+    );
+  }
+
+  if (target === "chrome") {
+    if (manifest.minimum_chrome_version !== "116") {
+      fail(
+        "manifest",
+        `chrome: expected minimum_chrome_version "116", got ${JSON.stringify(
+          manifest.minimum_chrome_version
+        )}`
+      );
+    }
+  } else {
+    const gecko = manifest?.browser_specific_settings?.gecko;
+    if (!gecko || gecko.id !== "wallet@lateo.dev" || typeof gecko.strict_min_version !== "string") {
+      fail("manifest", "firefox: missing or invalid browser_specific_settings.gecko");
+    }
+  }
+
   const csp = manifest?.content_security_policy?.extension_pages;
   if (typeof csp !== "string" || csp.trim().length === 0) {
     fail("manifest-csp", `${target}: missing content_security_policy.extension_pages`);
     return;
+  }
+
+  if (csp !== EXPECTED_EXTENSION_CSP) {
+    fail(
+      "manifest-csp",
+      `${target}: extension_pages CSP does not match exact allowlisted policy.\n  Expected: ${EXPECTED_EXTENSION_CSP}\n  Got:      ${csp}`
+    );
   }
 
   const tokens = csp.split(/[\s;]+/).filter(Boolean);
@@ -214,6 +253,22 @@ function auditManifest(target, distDir) {
   }
 
   const directives = parseCspDirectives(csp);
+  const expectedDirectiveNames = new Set([
+    "default-src",
+    "script-src",
+    "worker-src",
+    "style-src",
+    "img-src",
+    "connect-src",
+    "object-src",
+    "base-uri",
+    "form-action"
+  ]);
+  for (const name of directives.keys()) {
+    if (!expectedDirectiveNames.has(name)) {
+      fail("manifest-csp", `${target}: unexpected CSP directive "${name}"`);
+    }
+  }
   const requiredDirectives = [
     ["default-src", ["'none'"]],
     ["script-src", ["'self'", "'wasm-unsafe-eval'"]],
@@ -246,6 +301,39 @@ function extractHtmlReferencedAssets(htmlText) {
     refs.push(match[1]);
   }
   return refs;
+}
+
+function extractJsImportSpecifiers(code) {
+  const specs = [];
+  const staticRe = /\b(?:import|export)\s+(?:[^"'`]*?\s+from\s+)?["']([^"']+)["']/g;
+  const dynamicRe = /\bimport\s*\(\s*["']([^"']+)["']\s*\)/g;
+  let m;
+  while ((m = staticRe.exec(code)) !== null) specs.push(m[1]);
+  while ((m = dynamicRe.exec(code)) !== null) specs.push(m[1]);
+  return specs;
+}
+
+function resolveImportGraph(entryFiles, distDir) {
+  const visited = new Set();
+  const queue = [...entryFiles];
+  while (queue.length > 0) {
+    const current = queue.pop();
+    if (!current || visited.has(current)) continue;
+    visited.add(current);
+    if (!fs.existsSync(current)) continue;
+    const code = fs.readFileSync(current, "utf8");
+    for (const spec of extractJsImportSpecifiers(code)) {
+      if (spec.startsWith(".") || spec.startsWith("/")) {
+        const resolved = spec.startsWith("/")
+          ? path.resolve(distDir, spec.slice(1))
+          : path.resolve(path.dirname(current), spec);
+        if (!visited.has(resolved)) {
+          queue.push(resolved);
+        }
+      }
+    }
+  }
+  return visited;
 }
 
 function auditBundleIsolationAndAssets(target, distDir) {
@@ -336,6 +424,12 @@ function auditBundleIsolationAndAssets(target, distDir) {
       continue;
     }
     const htmlText = fs.readFileSync(htmlPath, "utf8");
+    if (!htmlText.includes(EXPECTED_UI_META_CSP)) {
+      fail(
+        "html-csp",
+        `${target}/${htmlName}: missing strict page-level meta CSP with connect-src 'none'`
+      );
+    }
     for (const marker of forbiddenEngineMarkers) {
       if (marker.pattern.test(htmlText)) {
         fail(
@@ -349,17 +443,10 @@ function auditBundleIsolationAndAssets(target, distDir) {
     }
     for (const ref of extractHtmlReferencedAssets(htmlText)) {
       if (ref.endsWith(".js")) {
-        uiJsFiles.add(path.resolve(distDir, ref));
+        const relRef = ref.replace(/^\/+/, "");
+        uiJsFiles.add(path.resolve(distDir, relRef));
       }
     }
-  }
-
-  // Also include all non-engine JS chunks in assets/ (everything except offscreen-*.js and zephyr.worker-*.js)
-  for (const entryName of assetEntries) {
-    if (!entryName.endsWith(".js")) continue;
-    if (/^offscreen-[A-Za-z0-9_-]+\.js$/.test(entryName)) continue;
-    if (/^zephyr\.worker-[A-Za-z0-9_-]+\.js$/.test(entryName)) continue;
-    uiJsFiles.add(path.join(assetsDir, entryName));
   }
 
   // On Chrome, background.js is the thin MV3 Service Worker and must never import zephyr-ts/WASM
@@ -370,6 +457,27 @@ function auditBundleIsolationAndAssets(target, distDir) {
     } else {
       uiJsFiles.add(swPath);
     }
+  }
+
+  // Walk the full transitive ES import graph from every UI entrypoint and Chrome SW
+  const reachableUiJs = resolveImportGraph(uiJsFiles, distDir);
+  for (const reached of reachableUiJs) {
+    const base = path.basename(reached);
+    if (/^offscreen-[A-Za-z0-9_-]+\.js$/.test(base) || /^zephyr\.worker-[A-Za-z0-9_-]+\.js$/.test(base)) {
+      fail(
+        "bundle-isolation",
+        `${target}: UI/SW import graph transitively reaches forbidden engine bundle ${path.relative(ROOT, reached)}`
+      );
+    }
+    uiJsFiles.add(reached);
+  }
+
+  // Also include all non-engine JS chunks in assets/ (everything except offscreen-*.js and zephyr.worker-*.js)
+  for (const entryName of assetEntries) {
+    if (!entryName.endsWith(".js")) continue;
+    if (/^offscreen-[A-Za-z0-9_-]+\.js$/.test(entryName)) continue;
+    if (/^zephyr\.worker-[A-Za-z0-9_-]+\.js$/.test(entryName)) continue;
+    uiJsFiles.add(path.join(assetsDir, entryName));
   }
 
   for (const jsFile of uiJsFiles) {

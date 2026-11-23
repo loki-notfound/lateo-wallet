@@ -60,7 +60,8 @@ export function validateNodeUrl(raw: string): ValidatedNodeUrl {
 
   const cleanPath = parsed.pathname.replace(/\/+$/, "");
   const normalizedUrl = `${parsed.origin}${cleanPath}`;
-  const originPattern = `${parsed.origin}/*`;
+  // Extension match patterns omit ports so Firefox and Chrome permissions.request/contains accept them.
+  const originPattern = `${parsed.protocol}//${parsed.hostname}/*`;
 
   return {
     url: normalizedUrl,

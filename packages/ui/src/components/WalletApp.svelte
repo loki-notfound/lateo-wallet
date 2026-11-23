@@ -56,6 +56,7 @@
     readonly txHashes: readonly string[];
     readonly relayedAt: number;
     readonly nodeHost: string;
+    readonly notRelayed?: boolean;
   } | null>(null);
   let errorMsg = $state<string | null>(null);
 
@@ -205,7 +206,8 @@
         relayReceipt = {
           txHashes: outcome.txHashes,
           relayedAt: outcome.relayedAt,
-          nodeHost: outcome.nodeHost
+          nodeHost: outcome.nodeHost,
+          ...(outcome.notRelayed ? { notRelayed: true } : {})
         };
       } else if (outcome.kind === "relayed-unsaved") {
         txFlowError = outcome.message;
@@ -232,6 +234,25 @@
       snapshot = await client.discardPrepared(token, verify);
     } catch (err) {
       txFlowError = err instanceof Error ? err.message : "Discard failed";
+      try {
+        snapshot = await client.getSnapshot();
+      } catch {
+        // Ignore secondary snapshot refresh error
+      }
+    } finally {
+      txFlowBusy = false;
+    }
+  }
+
+  async function handleClearUnresolvedRelay(): Promise<void> {
+    if (!client.clearUnresolvedRelay) return;
+    errorMsg = null;
+    txFlowError = null;
+    txFlowBusy = true;
+    try {
+      snapshot = await client.clearUnresolvedRelay();
+    } catch (err) {
+      txFlowError = err instanceof Error ? err.message : "Failed to clear unresolved relay barrier";
     } finally {
       txFlowBusy = false;
     }
@@ -369,18 +390,25 @@
 
     {#if relayReceipt && !snapshot?.savingState && !snapshot?.persistFailure}
       <section
-        class="lt-callout lt-callout-success lt-stack lt-screen-only"
+        class={relayReceipt.notRelayed
+          ? "lt-callout lt-callout-warning lt-stack lt-screen-only"
+          : "lt-callout lt-callout-success lt-stack lt-screen-only"}
         role="status"
         data-testid="relay-receipt-panel"
       >
         <div class="lt-sync-row">
-          <span class="lt-callout-title">Transaction broadcast &amp; wallet state saved</span>
+          <span class="lt-callout-title">
+            {relayReceipt.notRelayed
+              ? "Transaction accepted locally (not relayed to peers)"
+              : "Transaction broadcast & wallet state saved"}
+          </span>
           <span class="lt-tx-badge lt-tx-pending" data-testid="relay-receipt-status">
-            Pending in mempool
+            {relayReceipt.notRelayed ? "Not relayed — verify via sync" : "Pending in mempool"}
           </span>
         </div>
         <p class="lt-compact">
-          Relayed via <span class="lt-hash-short"><bdi>{relayReceipt.nodeHost}</bdi></span> at
+          {relayReceipt.notRelayed ? "Submitted to" : "Relayed via"}
+          <span class="lt-hash-short"><bdi>{relayReceipt.nodeHost}</bdi></span> at
           <span class="lt-num" data-testid="relay-receipt-timestamp">
             {new Date(relayReceipt.relayedAt).toISOString()}
           </span>
@@ -435,6 +463,51 @@
           onOpenNodeSettings={() => (activeTab = "security")}
           {...(onRequestOriginPermission ? { onGrantPermission: handleGrantNodePermission } : {})}
         />
+
+        {#if snapshot.unresolvedRelay && !snapshot.pendingTx}
+          <section
+            class="lt-panel lt-confirm-box lt-stack"
+            role="alert"
+            data-testid="unresolved-relay-banner"
+          >
+            <h2 class="lt-panel-title">Verify previous uncertain broadcast before sending again</h2>
+            <p class="lt-compact">
+              A prior transaction via
+              <span class="lt-hash-short"><bdi>{snapshot.unresolvedRelay.nodeHost}</bdi></span>
+              had an uncertain relay outcome (<bdi>{snapshot.unresolvedRelay.reason}</bdi>).
+              New transactions are paused until a wallet sync verifies whether it reached the network.
+            </p>
+            {#if snapshot.unresolvedRelay.txHashes.length > 0}
+              <div class="lt-stack">
+                {#each snapshot.unresolvedRelay.txHashes as hash (hash)}
+                  <code class="lt-hash" data-testid="unresolved-relay-txid"><bdi>{hash}</bdi></code>
+                {/each}
+              </div>
+            {/if}
+            <div class="lt-form-actions">
+              <button
+                type="button"
+                class="lt-btn lt-btn-primary"
+                disabled={busy || txFlowBusy}
+                onclick={handleSyncNow}
+                data-testid="sync-verify-unresolved-btn"
+              >
+                {busy ? "Syncing..." : "Sync now to verify"}
+              </button>
+              {#if client.clearUnresolvedRelay}
+                <button
+                  type="button"
+                  class="lt-btn lt-btn-secondary"
+                  disabled={busy || txFlowBusy}
+                  onclick={handleClearUnresolvedRelay}
+                  data-testid="clear-unresolved-relay-btn"
+                >
+                  Dismiss after manual verification
+                </button>
+              {/if}
+            </div>
+          </section>
+        {/if}
 
         {#if snapshot.pendingTx}
           <TxReviewPanel
@@ -592,7 +665,10 @@
                 balances={snapshot.balances}
                 nodeHost={snapshot.sync.nodeHost}
                 viewOnly={snapshot.activeWallet.viewOnly}
-                disabled={txFlowBusy || snapshot.savingState || snapshot.pendingTx !== null}
+                disabled={txFlowBusy ||
+                  snapshot.savingState ||
+                  snapshot.pendingTx !== null ||
+                  Boolean(snapshot.unresolvedRelay)}
                 onPrepared={handlePrepared}
               />
             </div>
@@ -610,7 +686,10 @@
                 primaryAddress={snapshot.activeWallet.primaryAddress}
                 nodeHost={snapshot.sync.nodeHost}
                 viewOnly={snapshot.activeWallet.viewOnly}
-                disabled={txFlowBusy || snapshot.savingState || snapshot.pendingTx !== null}
+                disabled={txFlowBusy ||
+                  snapshot.savingState ||
+                  snapshot.pendingTx !== null ||
+                  Boolean(snapshot.unresolvedRelay)}
                 {reserveBusy}
                 onRefreshReserve={handleRefreshReserve}
                 onPrepared={handlePrepared}
@@ -633,6 +712,7 @@
               <SettingsSecurity
                 {client}
                 {prefs}
+                activeNodeUrl={snapshot.sync.nodeUrl}
                 walletName={snapshot.activeWallet.name}
                 viewOnly={snapshot.activeWallet.viewOnly}
                 onPrefsUpdated={handlePrefsUpdated}

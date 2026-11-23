@@ -45,6 +45,7 @@ export class SyncController {
   private originPattern: string;
   private timer: ReturnType<typeof setInterval> | null = null;
   private syncInFlight: Promise<SyncStatusDto> | null = null;
+  private paused = false;
   private highestDaemonHeight = 0;
   private initialSyncPersisted = false;
   private lastCheckpointHeight = 0;
@@ -89,6 +90,34 @@ export class SyncController {
 
   getNodeUrl(): string {
     return this.nodeUrl;
+  }
+
+  isSyncing(): boolean {
+    return this.syncInFlight !== null;
+  }
+
+  setPaused(paused: boolean): void {
+    this.paused = paused;
+  }
+
+  async waitForIdle(timeoutMs = 10_000): Promise<boolean> {
+    const running = this.syncInFlight;
+    if (!running) return true;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const outcome = await Promise.race([
+        running.then(
+          () => true,
+          () => true
+        ),
+        new Promise<boolean>((resolve) => {
+          timer = setTimeout(() => resolve(false), timeoutMs);
+        })
+      ]);
+      return outcome;
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+    }
   }
 
   private updateStatus(patch: Partial<SyncStatusDto>): void {
@@ -138,7 +167,7 @@ export class SyncController {
   startBackgroundLoop(): void {
     if (this.timer) return;
     this.timer = setInterval(() => {
-      if (!this.adapter || this.syncInFlight) return;
+      if (!this.adapter || this.syncInFlight || this.paused) return;
       void this.syncOnce().catch(() => {
         // Sync state already transitioned cleanly to reconnecting/offline
       });
@@ -151,6 +180,7 @@ export class SyncController {
       this.timer = null;
     }
     this.adapter = null;
+    this.paused = false;
     this.highestDaemonHeight = 0;
     this.initialSyncPersisted = false;
     this.lastCheckpointHeight = 0;

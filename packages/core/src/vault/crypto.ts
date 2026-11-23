@@ -1,5 +1,9 @@
 import {
   DEFAULT_PBKDF2_ITERATIONS,
+  MAX_PBKDF2_ITERATIONS,
+  MIN_PBKDF2_ITERATIONS,
+  VAULT_IV_BYTES,
+  VAULT_SALT_BYTES,
   VAULT_SCHEMA_VERSION,
   type EncryptedVaultMetaRecord,
   type EncryptedWalletBlobRecord,
@@ -11,8 +15,6 @@ import {
 const TEXT_ENCODER = new TextEncoder();
 const TEXT_DECODER = new TextDecoder();
 
-const META_AAD = TEXT_ENCODER.encode(`lateo-vault:v${VAULT_SCHEMA_VERSION}:meta`);
-
 export class VaultAuthError extends Error {
   readonly code = "INVALID_PASSWORD" as const;
 
@@ -22,9 +24,43 @@ export class VaultAuthError extends Error {
   }
 }
 
-function blobAad(walletId: string, kind: WalletBlobKind): Uint8Array<ArrayBuffer> {
+function assertValidKdfDescriptor(kdf: KdfDescriptor): void {
+  if (kdf.alg !== "PBKDF2-SHA256") {
+    throw new Error("Unsupported vault KDF algorithm");
+  }
+  if (
+    typeof kdf.iterations !== "number" ||
+    !Number.isSafeInteger(kdf.iterations) ||
+    kdf.iterations < MIN_PBKDF2_ITERATIONS ||
+    kdf.iterations > MAX_PBKDF2_ITERATIONS
+  ) {
+    throw new Error("Vault KDF iteration count is out of bounds");
+  }
+  if (typeof kdf.salt !== "string" || kdf.salt.length === 0) {
+    throw new Error("Vault KDF salt is missing");
+  }
+}
+
+function metaAad(kdf: KdfDescriptor): Uint8Array<ArrayBuffer> {
   return new Uint8Array(
-    TEXT_ENCODER.encode(`lateo-vault:v${VAULT_SCHEMA_VERSION}:blob:${walletId}:${kind}`)
+    TEXT_ENCODER.encode(
+      `lateo-vault:v${VAULT_SCHEMA_VERSION}:meta:${kdf.alg}:${kdf.iterations}:${kdf.salt}`
+    )
+  );
+}
+
+function blobAad(
+  walletId: string,
+  kind: WalletBlobKind,
+  syncedHeight: number
+): Uint8Array<ArrayBuffer> {
+  if (!Number.isSafeInteger(syncedHeight) || syncedHeight < 0) {
+    throw new Error("Blob syncedHeight must be a non-negative integer");
+  }
+  return new Uint8Array(
+    TEXT_ENCODER.encode(
+      `lateo-vault:v${VAULT_SCHEMA_VERSION}:blob:${walletId}:${kind}:${syncedHeight}`
+    )
   );
 }
 
@@ -96,6 +132,16 @@ export async function deriveKek(
   if (password.length === 0) {
     throw new Error("Vault password must not be empty");
   }
+  if (salt.byteLength !== VAULT_SALT_BYTES) {
+    throw new Error(`Vault salt must be ${VAULT_SALT_BYTES} bytes`);
+  }
+  if (
+    !Number.isSafeInteger(iterations) ||
+    iterations < MIN_PBKDF2_ITERATIONS ||
+    iterations > MAX_PBKDF2_ITERATIONS
+  ) {
+    throw new Error("Vault KDF iteration count is out of bounds");
+  }
   const subtle = getSubtle();
   const passwordBytes = toArrayBufferCopy(TEXT_ENCODER.encode(password));
   try {
@@ -147,11 +193,12 @@ export async function encryptVaultMetaWithKek(
   kek: CryptoKey,
   kdf: KdfDescriptor
 ): Promise<EncryptedVaultMetaRecord> {
-  const iv = randomBytes(12);
+  assertValidKdfDescriptor(kdf);
+  const iv = randomBytes(VAULT_IV_BYTES);
   const plaintext = toArrayBufferCopy(TEXT_ENCODER.encode(JSON.stringify(manifest)));
   try {
     const encrypted = await getSubtle().encrypt(
-      { name: "AES-GCM", iv, additionalData: META_AAD },
+      { name: "AES-GCM", iv, additionalData: metaAad(kdf) },
       kek,
       plaintext
     );
@@ -178,7 +225,7 @@ export async function encryptVaultMeta(
   readonly kdf: KdfDescriptor;
 }> {
   const iterations = options?.iterations ?? DEFAULT_PBKDF2_ITERATIONS;
-  const salt = randomBytes(16);
+  const salt = randomBytes(VAULT_SALT_BYTES);
   const kdf: KdfDescriptor = {
     alg: "PBKDF2-SHA256",
     iterations,
@@ -201,18 +248,22 @@ export async function decryptVaultMeta(
   if (record.schemaVersion !== VAULT_SCHEMA_VERSION) {
     throw new Error("Unsupported vault schema version");
   }
-  if (record.kdf.alg !== "PBKDF2-SHA256") {
-    throw new Error("Unsupported vault KDF algorithm");
-  }
+  assertValidKdfDescriptor(record.kdf);
   const salt = fromBase64(record.kdf.salt);
   const iv = fromBase64(record.iv);
+  if (salt.byteLength !== VAULT_SALT_BYTES) {
+    throw new Error("Invalid vault salt length");
+  }
+  if (iv.byteLength !== VAULT_IV_BYTES) {
+    throw new Error("Invalid vault IV length");
+  }
   const ciphertext = fromBase64(record.ciphertext);
   const kek = await deriveKek(password, salt, record.kdf.iterations);
 
   let decryptedBuffer: ArrayBuffer;
   try {
     decryptedBuffer = await getSubtle().decrypt(
-      { name: "AES-GCM", iv, additionalData: META_AAD },
+      { name: "AES-GCM", iv, additionalData: metaAad(record.kdf) },
       kek,
       ciphertext
     );
@@ -249,8 +300,8 @@ export async function encryptWalletBlob(
   plaintext: Uint8Array,
   syncedHeight: number
 ): Promise<EncryptedWalletBlobRecord> {
-  const iv = randomBytes(12);
-  const aad = blobAad(walletId, kind);
+  const iv = randomBytes(VAULT_IV_BYTES);
+  const aad = blobAad(walletId, kind, syncedHeight);
   const payload = toArrayBufferCopy(plaintext);
   try {
     const encrypted = await getSubtle().encrypt(
@@ -281,7 +332,10 @@ export async function decryptWalletBlob(
     throw new Error("Unsupported blob schema version");
   }
   const iv = fromBase64(record.iv);
-  const aad = blobAad(record.walletId, record.kind);
+  if (iv.byteLength !== VAULT_IV_BYTES) {
+    throw new Error("Invalid blob IV length");
+  }
+  const aad = blobAad(record.walletId, record.kind, record.syncedHeight);
   const ciphertext = toArrayBufferCopy(record.ciphertext);
   const decrypted = await getSubtle().decrypt(
     { name: "AES-GCM", iv, additionalData: aad },

@@ -6,7 +6,8 @@ and `firefox` targets).
 
 ## Prerequisites
 
-- **Node.js:** `>=22` (LTS recommended)
+- **Node.js:** `>=22` (exact matching Node.js / zlib minor version required for
+  byte-identical DEFLATE archive digests across machines)
 - **Package manager:** `pnpm` via `corepack` (`pnpm@12.21.0` pinned in root
   `package.json`)
 

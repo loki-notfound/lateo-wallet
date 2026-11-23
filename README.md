@@ -48,8 +48,8 @@ See [`docs/BUILD.md`](docs/BUILD.md) for reproducible build and verification ins
   attributes in UI components (`pnpm check:ui-safety` and `pnpm check:security`).
 - Strict Manifest V3 Content Security Policy (`script-src 'self'
   'wasm-unsafe-eval'; style-src 'self'; object-src 'none'`).
-- `@loki-notfound/zephyr-ts` is installed from its signed GitHub release
-  tarball (`v2.3.0-sec.2-ts.2`) with integrity pinned in `pnpm-lock.yaml`, and
+- `@loki-notfound/zephyr-ts` (`v2.3.0-sec.2-ts.2`) is pinned by its exact
+  release tarball URL and SHA-512 SRI integrity hash in `pnpm-lock.yaml`, and
   `zephyr.wasm` is verified against its embedded SHA-256 digest before
   compilation.
 - All automated tests use fresh, random, empty disposable wallets only.

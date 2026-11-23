@@ -29,6 +29,7 @@ import type {
   SavingKind,
   SubaddressDto,
   TxPriorityDto,
+  UnresolvedRelayDto,
   WalletSnapshot,
   WalletSummaryDto,
   WalletTxDto,
@@ -47,7 +48,7 @@ import {
   generateWalletId,
   zeroize
 } from "../vault/crypto.js";
-import { MIN_VAULT_PASSWORD_LENGTH } from "../vault/password.js";
+import { MIN_VAULT_PASSWORD_LENGTH, evaluatePasswordStrength } from "../vault/password.js";
 import { normalizeSeedInput, validateMnemonicWordCount } from "../vault/seed-quiz.js";
 import {
   DEFAULT_PBKDF2_ITERATIONS,
@@ -64,7 +65,28 @@ import { TxFlowController, TxFlowError } from "./tx-flow.js";
 
 const DEFAULT_HEIGHT_FETCH_TIMEOUT_MS = 4_000;
 const NODE_PROBE_TIMEOUT_MS = 6_000;
+const DEFAULT_LOCK_CHECKPOINT_TIMEOUT_MS = 2_500;
+const DEFAULT_CLOSE_TIMEOUT_MS = 1_500;
 const HEX_64_RE = /^[0-9a-f]{64}$/i;
+const TEXT_ENCODER = new TextEncoder();
+const TEXT_DECODER = new TextDecoder();
+
+/** Controlled, secret-free validation or precondition error safe to surface to the UI. */
+export class WalletValidationError extends Error {
+  readonly code = "VALIDATION_ERROR" as const;
+
+  constructor(message: string) {
+    super(message);
+    this.name = "WalletValidationError";
+  }
+}
+
+type ActiveWalletInfo = Omit<WalletManifestEntry, "corePassword">;
+
+function toActiveWalletInfo(entry: WalletManifestEntry): ActiveWalletInfo {
+  const { corePassword: _omitted, ...safe } = entry;
+  return safe;
+}
 
 export interface WalletEngineOptions {
   readonly store: VaultBlobStore;
@@ -75,6 +97,8 @@ export interface WalletEngineOptions {
   readonly syncIntervalMs?: number;
   readonly enableBackgroundSync?: boolean;
   readonly heightFetchTimeoutMs?: number;
+  readonly lockCheckpointTimeoutMs?: number;
+  readonly closeTimeoutMs?: number;
   readonly checkOriginPermission?: (originPattern: string) => Promise<boolean>;
   readonly fetchDaemonHeight?: (network: ZephyrNetwork) => Promise<number | null>;
   readonly validateAddressFn?: (address: string, network: ZephyrNetwork) => Promise<void>;
@@ -88,13 +112,21 @@ export interface WalletEngineOptions {
 
 function assertValidPassword(password: string, label = "Vault password"): void {
   if (typeof password !== "string" || password.length < MIN_VAULT_PASSWORD_LENGTH) {
-    throw new Error(`${label} must be at least ${MIN_VAULT_PASSWORD_LENGTH} characters`);
+    throw new WalletValidationError(
+      `${label} must be at least ${MIN_VAULT_PASSWORD_LENGTH} characters`
+    );
+  }
+  const strength = evaluatePasswordStrength(password);
+  if (!strength.valid) {
+    throw new WalletValidationError(
+      `${label} is too weak — use 12+ characters or mix character types`
+    );
   }
 }
 
 function assertValidRestoreHeight(height: number): void {
   if (typeof height !== "number" || !Number.isSafeInteger(height) || height < 0) {
-    throw new Error("Restore height must be a non-negative whole number");
+    throw new WalletValidationError("Restore height must be a non-negative whole number");
   }
 }
 
@@ -194,6 +226,8 @@ export class WalletEngine {
   private readonly proxyToWorker: boolean;
   private readonly pbkdf2Iterations: number;
   private readonly heightFetchTimeoutMs: number;
+  private readonly lockCheckpointTimeoutMs: number;
+  private readonly closeTimeoutMs: number;
   private readonly enableBackgroundSync: boolean;
   private readonly checkOriginPermission:
     | ((originPattern: string) => Promise<boolean>)
@@ -208,17 +242,27 @@ export class WalletEngine {
   private readonly txFlow: TxFlowController;
 
   private activeNodeUrl: string;
+  private userSwitchedNode = false;
   private queue: Promise<unknown> = Promise.resolve();
+  private persistChain: Promise<void> = Promise.resolve();
+  private activePersistCount = 0;
+  private postRelayActiveCount = 0;
+  private persistEpoch = 0;
+  private lastPostRelayFailureEpoch = 0;
+  private sessionGeneration = 0;
+  private hasVaultCached = false;
   private activeWallet: ZephyrWallet | null = null;
   private activeManifest: VaultManifestPlaintext | null = null;
-  private activeEntry: WalletManifestEntry | null = null;
+  private activeEntry: ActiveWalletInfo | null = null;
   private kek: CryptoKey | null = null;
   private kdf: KdfDescriptor | null = null;
   private dekKey: CryptoKey | null = null;
   private savingState = false;
   private savingKind: SavingKind | null = null;
   private persistFailure: PersistFailureDto | null = null;
+  private unresolvedRelay: UnresolvedRelayDto | null = null;
   private postRelaySavePromise: Promise<void> | null = null;
+  private activeRelayOp: Promise<void> | null = null;
   private syncBusy = false;
   private relayBusy = false;
   private lastPersistedAt: number | null = null;
@@ -231,6 +275,9 @@ export class WalletEngine {
     this.pbkdf2Iterations = options.pbkdf2Iterations ?? DEFAULT_PBKDF2_ITERATIONS;
     this.activeNodeUrl = validateNodeUrl(options.defaultNodeUrl ?? DEFAULT_PUBLIC_NODE_URL).url;
     this.heightFetchTimeoutMs = options.heightFetchTimeoutMs ?? DEFAULT_HEIGHT_FETCH_TIMEOUT_MS;
+    this.lockCheckpointTimeoutMs =
+      options.lockCheckpointTimeoutMs ?? DEFAULT_LOCK_CHECKPOINT_TIMEOUT_MS;
+    this.closeTimeoutMs = options.closeTimeoutMs ?? DEFAULT_CLOSE_TIMEOUT_MS;
     this.enableBackgroundSync = options.enableBackgroundSync ?? true;
     this.checkOriginPermission = options.checkOriginPermission;
     this.fetchDaemonHeightFn =
@@ -279,6 +326,10 @@ export class WalletEngine {
           } catch {
             // Reserve banner remains at last known good reading on transient failure
           }
+          // A successful chain sync reconciles outputs and clears any unresolved-relay barrier.
+          if (this.unresolvedRelay && !this.txFlow.getPending()) {
+            await this.clearUnresolvedRelayMarkerInternal();
+          }
           this.txFlow.checkExpiry();
         }
       }
@@ -291,6 +342,10 @@ export class WalletEngine {
         const reserveHeight = this.reserveService.getCached()?.height ?? 0;
         return Math.max(sync.daemonHeight, sync.walletHeight, reserveHeight);
       },
+      refreshDaemonHeight: async () => {
+        if (!this.activeWallet) return null;
+        return await fetchHeightFromDaemon(this.activeNodeUrl, 2_000);
+      },
       getReserve: () => this.reserveService.getCached(),
       getNode: () => {
         const validated = validateNodeUrl(this.activeNodeUrl);
@@ -301,10 +356,15 @@ export class WalletEngine {
         if (!entry) return null;
         return BigInt(entry.unlocked);
       },
-      blockNewTransaction: () =>
-        this.persistFailure
-          ? "A previous transaction was relayed, but wallet state has not been saved to disk yet. Retry saving first."
-          : null,
+      blockNewTransaction: () => {
+        if (this.persistFailure) {
+          return "A previous transaction was relayed, but wallet state has not been saved to disk yet. Retry saving first.";
+        }
+        if (this.unresolvedRelay) {
+          return "A previous transaction had an uncertain broadcast status. Sync the wallet to verify whether it reached the network before preparing a new transaction.";
+        }
+        return null;
+      },
       beforeRelay: async () => {
         this.relayBusy = true;
         this.emitBusyState();
@@ -318,6 +378,8 @@ export class WalletEngine {
             );
           }
         }
+        // Wait briefly for any already-running background sync to settle before starting relay timer.
+        await this.syncController.waitForIdle(10_000);
         if (this.activeWallet) {
           await this.activeWallet.setDaemonConnection(this.activeNodeUrl);
         }
@@ -325,6 +387,32 @@ export class WalletEngine {
       afterRelay: () => {
         this.relayBusy = false;
         this.emitBusyState();
+      },
+      onSyncPauseChange: (paused) => {
+        this.syncController.setPaused(paused);
+      },
+      onRelayUnknown: (info) => {
+        void this.persistUnresolvedRelayMarker({
+          txHashes: info.txHashes,
+          recordedAt: Date.now(),
+          nodeHost: info.nodeHost,
+          reason: info.reason
+        });
+      },
+      onUncertainRejection: (info) => {
+        void this.persistUnresolvedRelayMarker({
+          txHashes: info.txHashes,
+          recordedAt: Date.now(),
+          nodeHost: info.nodeHost,
+          reason: info.reason
+        }).then(() => {
+          if (this.activeWallet) {
+            void this.syncController.syncOnce().catch(() => {});
+          }
+        });
+      },
+      onRelayConfirmed: () => {
+        void this.clearUnresolvedRelayMarkerInternal();
       },
       persistAfterRelay: async (txHashes) => {
         await this.persistPostRelayBlobs(txHashes);
@@ -358,6 +446,15 @@ export class WalletEngine {
     return run;
   }
 
+  private runSerializedPersist<T>(task: () => Promise<T>): Promise<T> {
+    const run = this.persistChain.then(task, task);
+    this.persistChain = run.then(
+      () => undefined,
+      () => undefined
+    );
+    return run;
+  }
+
   private async emitSnapshot(): Promise<WalletSnapshot> {
     const snap = await this.buildSnapshot();
     this.onSnapshot?.(snap);
@@ -365,7 +462,15 @@ export class WalletEngine {
   }
 
   private async buildSnapshot(): Promise<WalletSnapshot> {
-    const meta = await this.store.readMeta();
+    let hasVault = this.hasVaultCached || this.activeEntry !== null;
+    try {
+      const meta = await this.store.readMeta();
+      hasVault = meta !== undefined;
+      this.hasVaultCached = hasVault;
+    } catch {
+      // Tolerate transient IndexedDB read errors so savingState / error recovery never wedges
+    }
+
     const activeSummary: WalletSummaryDto | null = this.activeEntry
       ? {
           id: this.activeEntry.id,
@@ -381,12 +486,13 @@ export class WalletEngine {
       : null;
 
     return {
-      hasVault: meta !== undefined,
+      hasVault,
       locked: this.activeWallet === null,
       savingState: this.savingState,
       savingKind: this.savingKind,
       pendingTx: this.txFlow.getPending(),
       persistFailure: this.persistFailure,
+      unresolvedRelay: this.unresolvedRelay,
       activeWallet: activeSummary,
       balances: this.cachedBalances,
       sync: this.syncController.getStatus(),
@@ -408,7 +514,8 @@ export class WalletEngine {
 
   isSavingOrRelayCritical(): boolean {
     return (
-      this.savingState ||
+      this.savingKind === "post-relay" ||
+      this.postRelayActiveCount > 0 ||
       this.relayBusy ||
       this.txFlow.isRelayInFlight() ||
       this.postRelaySavePromise !== null ||
@@ -416,8 +523,23 @@ export class WalletEngine {
     );
   }
 
+  /**
+   * Apply a persisted custom node URL on host startup before create/restore/unlock
+   * without triggering a network sync or overriding an explicit SWITCH_NODE.
+   */
+  setInitialNodeUrl(rawUrl: string): void {
+    if (this.userSwitchedNode) return;
+    try {
+      const validated = validateNodeUrl(rawUrl);
+      this.activeNodeUrl = validated.url;
+      this.syncController.setNodeUrl(validated.url);
+    } catch {
+      // Keep current valid node URL if persisted preference is malformed
+    }
+  }
+
   async getSnapshot(): Promise<WalletSnapshot> {
-    return this.enqueue(() => this.buildSnapshot());
+    return this.buildSnapshot();
   }
 
   private async readBalances(wallet: ZephyrWallet): Promise<readonly BalanceEntryDto[]> {
@@ -478,31 +600,115 @@ export class WalletEngine {
     }
   }
 
+  private async persistUnresolvedRelayMarker(marker: UnresolvedRelayDto): Promise<void> {
+    this.unresolvedRelay = marker;
+    const entry = this.activeEntry;
+    const dekKey = this.dekKey;
+    if (!entry || !dekKey) return;
+    let payload: Uint8Array | undefined;
+    try {
+      payload = TEXT_ENCODER.encode(JSON.stringify(marker));
+      const enc = await encryptWalletBlob(dekKey, entry.id, "relay", payload, 0);
+      await this.store.writeBlob(enc);
+    } catch {
+      // In-memory unresolvedRelay barrier remains active even if disk write fails
+    } finally {
+      zeroize(payload);
+    }
+    await this.emitSnapshot();
+  }
+
+  private async clearUnresolvedRelayMarkerInternal(): Promise<void> {
+    const had = this.unresolvedRelay !== null;
+    this.unresolvedRelay = null;
+    const entry = this.activeEntry;
+    const dekKey = this.dekKey;
+    if (entry && dekKey) {
+      let payload: Uint8Array | undefined;
+      try {
+        payload = TEXT_ENCODER.encode("null");
+        const enc = await encryptWalletBlob(dekKey, entry.id, "relay", payload, 0);
+        await this.store.writeBlob(enc);
+      } catch {
+        // Best-effort clear of persisted relay marker
+      } finally {
+        zeroize(payload);
+      }
+    }
+    if (had) {
+      await this.emitSnapshot();
+    }
+  }
+
+  private async loadUnresolvedRelayMarker(
+    walletId: string,
+    dekKey: CryptoKey
+  ): Promise<UnresolvedRelayDto | null> {
+    try {
+      const record = await this.store.readBlob(walletId, "relay");
+      if (!record) return null;
+      const bytes = await decryptWalletBlob(dekKey, record);
+      try {
+        const parsed = JSON.parse(TEXT_DECODER.decode(bytes)) as UnresolvedRelayDto | null;
+        if (
+          parsed &&
+          typeof parsed === "object" &&
+          Array.isArray(parsed.txHashes) &&
+          typeof parsed.recordedAt === "number" &&
+          typeof parsed.nodeHost === "string" &&
+          typeof parsed.reason === "string"
+        ) {
+          return {
+            txHashes: parsed.txHashes.filter((h): h is string => typeof h === "string"),
+            recordedAt: parsed.recordedAt,
+            nodeHost: parsed.nodeHost,
+            reason: parsed.reason
+          };
+        }
+        return null;
+      } finally {
+        zeroize(bytes);
+      }
+    } catch {
+      return null;
+    }
+  }
+
   private async commitNewVault(
     wallet: ZephyrWallet,
     walletId: string,
     dekKey: CryptoKey,
     metaRecord: EncryptedVaultMetaRecord
   ): Promise<void> {
-    this.savingState = true;
-    this.savingKind = "checkpoint";
-    this.emitBusyState();
-    await this.emitSnapshot();
-    try {
-      const blobs = await this.encryptActiveWalletBlobs(wallet, walletId, dekKey);
-      if (this.store.writeVaultAtomic) {
-        await this.store.writeVaultAtomic(metaRecord, blobs);
-      } else {
-        await this.store.writeBlob(blobs[0]);
-        await this.store.writeBlob(blobs[1]);
-        await this.store.writeMeta(metaRecord);
+    await this.runSerializedPersist(async () => {
+      this.activePersistCount += 1;
+      try {
+        this.savingState = true;
+        this.savingKind = this.postRelayActiveCount > 0 ? "post-relay" : "checkpoint";
+        this.emitBusyState();
+        await this.emitSnapshot();
+        const blobs = await this.encryptActiveWalletBlobs(wallet, walletId, dekKey);
+        if (this.store.writeVaultAtomic) {
+          await this.store.writeVaultAtomic(metaRecord, blobs);
+        } else {
+          await this.store.writeBlob(blobs[0]);
+          await this.store.writeBlob(blobs[1]);
+          await this.store.writeMeta(metaRecord);
+        }
+        this.hasVaultCached = true;
+        this.lastPersistedAt = Date.now();
+      } finally {
+        this.activePersistCount = Math.max(0, this.activePersistCount - 1);
+        this.savingState = this.activePersistCount > 0;
+        this.savingKind =
+          this.postRelayActiveCount > 0
+            ? "post-relay"
+            : this.activePersistCount > 0
+              ? "checkpoint"
+              : null;
+        this.emitBusyState();
       }
-      this.lastPersistedAt = Date.now();
-    } finally {
-      this.savingState = false;
-      this.savingKind = null;
-      this.emitBusyState();
-    }
+    });
   }
 
   private async persistActiveWalletBlobs(
@@ -511,25 +717,52 @@ export class WalletEngine {
     dekKey: CryptoKey,
     kind: SavingKind = "checkpoint"
   ): Promise<void> {
-    this.savingState = true;
-    this.savingKind = kind;
-    this.emitBusyState();
-    await this.emitSnapshot();
-    try {
-      const [encKeys, encCache] = await this.encryptActiveWalletBlobs(wallet, walletId, dekKey);
-      if (this.store.writeBlobsAtomic) {
-        await this.store.writeBlobsAtomic([encKeys, encCache]);
-      } else {
-        await this.store.writeBlob(encKeys);
-        await this.store.writeBlob(encCache);
+    await this.runSerializedPersist(async () => {
+      if (kind === "checkpoint" && (this.activeWallet !== wallet || this.persistFailure !== null)) {
+        return;
       }
-      this.lastPersistedAt = Date.now();
-      this.persistFailure = null;
-    } finally {
-      this.savingState = false;
-      this.savingKind = null;
-      this.emitBusyState();
-    }
+      const startedEpoch = ++this.persistEpoch;
+      const gen = this.sessionGeneration;
+      this.activePersistCount += 1;
+      if (kind === "post-relay") {
+        this.postRelayActiveCount += 1;
+      }
+      try {
+        this.savingState = true;
+        this.savingKind = this.postRelayActiveCount > 0 ? "post-relay" : kind;
+        this.emitBusyState();
+        await this.emitSnapshot();
+        const [encKeys, encCache] = await this.encryptActiveWalletBlobs(wallet, walletId, dekKey);
+        if (gen !== this.sessionGeneration && kind === "checkpoint") {
+          return;
+        }
+        if (this.store.writeBlobsAtomic) {
+          await this.store.writeBlobsAtomic([encKeys, encCache]);
+        } else {
+          await this.store.writeBlob(encKeys);
+          await this.store.writeBlob(encCache);
+        }
+        if (gen === this.sessionGeneration) {
+          this.lastPersistedAt = Date.now();
+          if (kind === "post-relay" || startedEpoch > this.lastPostRelayFailureEpoch) {
+            this.persistFailure = null;
+          }
+        }
+      } finally {
+        this.activePersistCount = Math.max(0, this.activePersistCount - 1);
+        if (kind === "post-relay") {
+          this.postRelayActiveCount = Math.max(0, this.postRelayActiveCount - 1);
+        }
+        this.savingState = this.activePersistCount > 0;
+        this.savingKind =
+          this.postRelayActiveCount > 0
+            ? "post-relay"
+            : this.activePersistCount > 0
+              ? "checkpoint"
+              : null;
+        this.emitBusyState();
+      }
+    });
   }
 
   private async persistPostRelayBlobs(txHashes: readonly string[]): Promise<void> {
@@ -544,13 +777,11 @@ export class WalletEngine {
         await this.persistActiveWalletBlobs(wallet, entry.id, dekKey, "post-relay");
         this.cachedBalances = await this.readBalances(wallet);
       } catch (err) {
+        this.lastPostRelayFailureEpoch = ++this.persistEpoch;
         this.persistFailure = {
           txHashes: [...txHashes],
           failedAt: Date.now(),
-          message:
-            err instanceof Error && err.message
-              ? err.message
-              : "IndexedDB commit failed after relay"
+          message: "IndexedDB commit failed after relay"
         };
         this.emitBusyState();
         throw err;
@@ -571,6 +802,16 @@ export class WalletEngine {
     }
   }
 
+  private async assertNoExistingVault(): Promise<void> {
+    const existingMeta = await this.store.readMeta();
+    if (existingMeta !== undefined) {
+      this.hasVaultCached = true;
+      throw new WalletValidationError(
+        "A vault already exists — reset the existing vault before creating or restoring a new wallet"
+      );
+    }
+  }
+
   async createWallet(params: {
     readonly password: string;
     readonly name: string;
@@ -578,6 +819,7 @@ export class WalletEngine {
   }): Promise<CreateWalletResultDto> {
     return this.enqueue(async () => {
       assertValidPassword(params.password);
+      await this.assertNoExistingVault();
       await this.closeActiveWalletInternal(false);
 
       const network: ZephyrNetwork = params.network ?? "mainnet";
@@ -633,12 +875,14 @@ export class WalletEngine {
         });
         await this.commitNewVault(wallet, walletId, dekKey, record);
 
+        this.sessionGeneration += 1;
         this.activeWallet = wallet;
         this.activeManifest = manifest;
-        this.activeEntry = entry;
+        this.activeEntry = toActiveWalletInfo(entry);
         this.kek = kek;
         this.kdf = kdf;
         this.dekKey = dekKey;
+        this.unresolvedRelay = null;
         this.cachedBalances = await this.readBalances(wallet);
         this.txFlow.attach(wallet, entry.network, entry.viewOnly);
         this.attachSyncForActiveWallet(wallet, await wallet.getHeight());
@@ -671,10 +915,12 @@ export class WalletEngine {
 
       const wordCheck = validateMnemonicWordCount(params.seed);
       if (!wordCheck.valid) {
-        throw new Error(`Recovery seed must contain 25 words (received ${wordCheck.count})`);
+        throw new WalletValidationError(
+          `Recovery seed must contain 25 words (received ${wordCheck.count})`
+        );
       }
 
-      await this.closeActiveWalletInternal(false);
+      await this.assertNoExistingVault();
 
       const network: ZephyrNetwork = params.network ?? "mainnet";
       const normalizedSeed = normalizeSeedInput(params.seed);
@@ -692,7 +938,7 @@ export class WalletEngine {
           proxyToWorker: this.proxyToWorker
         });
       } catch {
-        throw new Error("Invalid 25-word recovery seed or checksum");
+        throw new WalletValidationError("Invalid 25-word recovery seed or checksum");
       }
 
       try {
@@ -715,17 +961,21 @@ export class WalletEngine {
           wallets: [entry]
         };
 
-        const { record, kek, kdf } = await encryptVaultMeta(manifest, params.password, {
+        const { record } = await encryptVaultMeta(manifest, params.password, {
           iterations: this.pbkdf2Iterations
         });
+        await this.closeActiveWalletInternal(false);
         await this.commitNewVault(wallet, walletId, dekKey, record);
 
+        this.sessionGeneration += 1;
         this.activeWallet = wallet;
-        this.activeManifest = manifest;
-        this.activeEntry = entry;
-        this.kek = kek;
-        this.kdf = kdf;
+        // Backup is already verified for restored wallets; drop raw manifest/KEK from heap.
+        this.activeManifest = null;
+        this.activeEntry = toActiveWalletInfo(entry);
+        this.kek = null;
+        this.kdf = null;
         this.dekKey = dekKey;
+        this.unresolvedRelay = null;
         this.cachedBalances = await this.readBalances(wallet);
         this.txFlow.attach(wallet, entry.network, entry.viewOnly);
         this.attachSyncForActiveWallet(wallet, await wallet.getHeight());
@@ -754,18 +1004,18 @@ export class WalletEngine {
       const viewKey = params.privateViewKey.trim().toLowerCase();
 
       if (!address) {
-        throw new Error("Primary address is required");
+        throw new WalletValidationError("Primary address is required");
       }
       if (!HEX_64_RE.test(viewKey)) {
-        throw new Error("Private view key must be 64 hexadecimal characters");
+        throw new WalletValidationError("Private view key must be 64 hexadecimal characters");
       }
       try {
-        await validateAddress(address, network);
+        await this.validateAddressFn(address, network);
       } catch {
-        throw new Error(`Invalid Zephyr ${network} address`);
+        throw new WalletValidationError(`Invalid Zephyr ${network} address`);
       }
 
-      await this.closeActiveWalletInternal(false);
+      await this.assertNoExistingVault();
 
       const corePassword = generateCorePassword();
       const walletId = generateWalletId();
@@ -782,7 +1032,7 @@ export class WalletEngine {
           proxyToWorker: this.proxyToWorker
         });
       } catch {
-        throw new Error("Address and private view key could not be verified");
+        throw new WalletValidationError("Address and private view key could not be verified");
       }
 
       try {
@@ -810,17 +1060,20 @@ export class WalletEngine {
           wallets: [entry]
         };
 
-        const { record, kek, kdf } = await encryptVaultMeta(manifest, params.password, {
+        const { record } = await encryptVaultMeta(manifest, params.password, {
           iterations: this.pbkdf2Iterations
         });
+        await this.closeActiveWalletInternal(false);
         await this.commitNewVault(wallet, walletId, dekKey, record);
 
+        this.sessionGeneration += 1;
         this.activeWallet = wallet;
-        this.activeManifest = manifest;
-        this.activeEntry = entry;
-        this.kek = kek;
-        this.kdf = kdf;
+        this.activeManifest = null;
+        this.activeEntry = toActiveWalletInfo(entry);
+        this.kek = null;
+        this.kdf = null;
         this.dekKey = dekKey;
+        this.unresolvedRelay = null;
         this.cachedBalances = await this.readBalances(wallet);
         this.txFlow.attach(wallet, entry.network, entry.viewOnly);
         this.attachSyncForActiveWallet(wallet, await wallet.getHeight());
@@ -834,26 +1087,38 @@ export class WalletEngine {
 
   async markSeedBackupVerified(): Promise<WalletSnapshot> {
     return this.enqueue(async () => {
-      if (!this.activeWallet || !this.activeEntry || !this.activeManifest || !this.kek || !this.kdf) {
-        throw new Error("Wallet must be unlocked to update backup status");
+      if (!this.activeWallet || !this.activeEntry) {
+        throw new WalletValidationError("Wallet must be unlocked to update backup status");
       }
       if (this.activeEntry.seedBackupVerified) {
         return await this.buildSnapshot();
       }
-      const updatedEntry: WalletManifestEntry = {
-        ...this.activeEntry,
+      if (!this.activeManifest || !this.kek || !this.kdf) {
+        throw new WalletValidationError("Wallet session cannot update backup status");
+      }
+      const existingManifestEntry = this.activeManifest.wallets.find(
+        (w) => w.id === this.activeEntry!.id
+      );
+      if (!existingManifestEntry) {
+        throw new Error("Active wallet missing from vault manifest");
+      }
+      const updatedManifestEntry: WalletManifestEntry = {
+        ...existingManifestEntry,
         seedBackupVerified: true
       };
       const updatedManifest: VaultManifestPlaintext = {
         ...this.activeManifest,
         wallets: this.activeManifest.wallets.map((w) =>
-          w.id === updatedEntry.id ? updatedEntry : w
+          w.id === updatedManifestEntry.id ? updatedManifestEntry : w
         )
       };
       const updatedMeta = await encryptVaultMetaWithKek(updatedManifest, this.kek, this.kdf);
       await this.store.writeMeta(updatedMeta);
-      this.activeEntry = updatedEntry;
-      this.activeManifest = updatedManifest;
+      this.activeEntry = toActiveWalletInfo(updatedManifestEntry);
+      // Drop raw manifest (DEK + corePassword) and KEK from heap now that backup is verified.
+      this.activeManifest = null;
+      this.kek = null;
+      this.kdf = null;
       return await this.emitSnapshot();
     });
   }
@@ -862,7 +1127,7 @@ export class WalletEngine {
     return this.enqueue(async () => {
       const meta = await this.store.readMeta();
       if (!meta) {
-        throw new Error("No vault found");
+        throw new WalletValidationError("No vault found");
       }
       const { manifest, kek, kdf, dekKey } = await decryptVaultMeta(meta, password);
       const entry = manifest.wallets[0];
@@ -906,17 +1171,28 @@ export class WalletEngine {
           throw new Error("Decrypted wallet address does not match vault metadata");
         }
 
-        const normalizedEntry: WalletManifestEntry = {
-          ...entry,
+        const normalizedEntry: ActiveWalletInfo = {
+          ...toActiveWalletInfo(entry),
           restoreHeightSource: entry.restoreHeightSource ?? "offline-estimate"
         };
+        const unresolvedRelay = await this.loadUnresolvedRelayMarker(entry.id, dekKey);
 
+        this.sessionGeneration += 1;
+        this.hasVaultCached = true;
         this.activeWallet = wallet;
-        this.activeManifest = manifest;
+        // Retain manifest/KEK in memory only while seedBackupVerified is still false.
+        if (normalizedEntry.seedBackupVerified) {
+          this.activeManifest = null;
+          this.kek = null;
+          this.kdf = null;
+        } else {
+          this.activeManifest = manifest;
+          this.kek = kek;
+          this.kdf = kdf;
+        }
         this.activeEntry = normalizedEntry;
-        this.kek = kek;
-        this.kdf = kdf;
         this.dekKey = dekKey;
+        this.unresolvedRelay = unresolvedRelay;
         this.lastPersistedAt = encCache?.updatedAt ?? encKeys.updatedAt;
         this.cachedBalances = await this.readBalances(wallet);
         this.txFlow.attach(wallet, normalizedEntry.network, normalizedEntry.viewOnly);
@@ -939,16 +1215,16 @@ export class WalletEngine {
   }): Promise<void> {
     return this.enqueue(async () => {
       if (!this.activeWallet || !this.activeEntry) {
-        throw new Error("Wallet must be unlocked to change password");
+        throw new WalletValidationError("Wallet must be unlocked to change password");
       }
       assertValidPassword(params.newPassword, "New vault password");
       if (params.currentPassword === params.newPassword) {
-        throw new Error("New password must differ from current password");
+        throw new WalletValidationError("New password must differ from current password");
       }
 
       const existingMeta = await this.store.readMeta();
       if (!existingMeta) {
-        throw new Error("No vault found");
+        throw new WalletValidationError("No vault found");
       }
 
       const { manifest } = await decryptVaultMeta(existingMeta, params.currentPassword);
@@ -957,20 +1233,26 @@ export class WalletEngine {
       });
       await this.store.writeMeta(record);
 
-      this.activeManifest = manifest;
-      this.kek = kek;
-      this.kdf = kdf;
+      if (!this.activeEntry.seedBackupVerified) {
+        this.activeManifest = manifest;
+        this.kek = kek;
+        this.kdf = kdf;
+      } else {
+        this.activeManifest = null;
+        this.kek = null;
+        this.kdf = null;
+      }
     });
   }
 
   async revealSecrets(password: string): Promise<RevealedSecretsDto> {
     return this.enqueue(async () => {
       if (!this.activeWallet || !this.activeEntry) {
-        throw new Error("Wallet must be unlocked to reveal secrets");
+        throw new WalletValidationError("Wallet must be unlocked to reveal secrets");
       }
       const existingMeta = await this.store.readMeta();
       if (!existingMeta) {
-        throw new Error("No vault found");
+        throw new WalletValidationError("No vault found");
       }
       await decryptVaultMeta(existingMeta, password);
 
@@ -994,13 +1276,12 @@ export class WalletEngine {
   }
 
   async syncNow(): Promise<WalletSnapshot> {
-    return this.enqueue(async () => {
-      if (!this.activeWallet) {
-        return await this.buildSnapshot();
-      }
-      await this.syncController.syncOnce();
-      return await this.emitSnapshot();
-    });
+    // Run outside the command queue so long chain scans never block Lock or status reads.
+    if (!this.activeWallet) {
+      return await this.buildSnapshot();
+    }
+    await this.syncController.syncOnce();
+    return await this.emitSnapshot();
   }
 
   async refreshReserve(): Promise<ReserveStatusDto | null> {
@@ -1090,24 +1371,28 @@ export class WalletEngine {
   }
 
   async setActiveNode(rawUrl: string): Promise<WalletSnapshot> {
-    return this.enqueue(async () => {
-      const validated = validateNodeUrl(rawUrl);
+    const validated = validateNodeUrl(rawUrl);
+    await this.enqueue(async () => {
+      this.userSwitchedNode = true;
       this.activeNodeUrl = validated.url;
       this.txFlow.release();
       this.syncController.setNodeUrl(validated.url);
       this.reserveService.resetForNodeSwitch();
       if (this.activeWallet) {
         await this.activeWallet.setDaemonConnection(validated.url);
-        await this.syncController.syncOnce();
       }
-      return await this.emitSnapshot();
     });
+    // Run the follow-up sync outside the engine queue so Lock can pre-empt a slow node.
+    if (this.activeWallet) {
+      await this.syncController.syncOnce();
+    }
+    return await this.emitSnapshot();
   }
 
   async listSubaddresses(): Promise<readonly SubaddressDto[]> {
     return this.enqueue(async () => {
       if (!this.activeWallet) {
-        throw new Error("Wallet must be unlocked");
+        throw new WalletValidationError("Wallet must be unlocked");
       }
       const list = await this.activeWallet.getSubaddresses(0);
       return list.map(mapSubaddress);
@@ -1117,9 +1402,9 @@ export class WalletEngine {
   async createSubaddress(label?: string): Promise<SubaddressDto> {
     return this.enqueue(async () => {
       if (!this.activeWallet || !this.activeEntry || !this.dekKey) {
-        throw new Error("Wallet must be unlocked");
+        throw new WalletValidationError("Wallet must be unlocked");
       }
-      const cleanLabel = (label ?? "").trim().slice(0, 120);
+      const cleanLabel = (typeof label === "string" ? label : "").trim().slice(0, 120);
       const sub = await this.activeWallet.createSubaddress(0, cleanLabel);
       await this.persistActiveWalletBlobs(this.activeWallet, this.activeEntry.id, this.dekKey);
       await this.emitSnapshot();
@@ -1130,9 +1415,12 @@ export class WalletEngine {
   async setSubaddressLabel(index: number, label: string): Promise<readonly SubaddressDto[]> {
     return this.enqueue(async () => {
       if (!this.activeWallet || !this.activeEntry || !this.dekKey) {
-        throw new Error("Wallet must be unlocked");
+        throw new WalletValidationError("Wallet must be unlocked");
       }
-      const cleanLabel = label.trim().slice(0, 120);
+      if (!Number.isSafeInteger(index) || index < 0) {
+        throw new WalletValidationError("Subaddress index must be a non-negative integer");
+      }
+      const cleanLabel = (typeof label === "string" ? label : "").trim().slice(0, 120);
       await this.activeWallet.setSubaddressLabel(0, index, cleanLabel);
       await this.persistActiveWalletBlobs(this.activeWallet, this.activeEntry.id, this.dekKey);
       const list = await this.activeWallet.getSubaddresses(0);
@@ -1249,24 +1537,61 @@ export class WalletEngine {
   }
 
   async relayPrepared(token: string): Promise<RelayOutcomeDto> {
-    return this.enqueue(() => this.txFlow.relay(token));
+    const op = this.enqueue(() => this.txFlow.relay(token));
+    const settled = op.then(
+      () => undefined,
+      () => undefined
+    );
+    this.activeRelayOp = settled;
+    try {
+      return await op;
+    } finally {
+      if (this.activeRelayOp === settled) {
+        this.activeRelayOp = null;
+      }
+    }
   }
 
   async discardPrepared(token: string, verify = false): Promise<WalletSnapshot> {
-    return this.enqueue(async () => {
-      const { wasRelayUnknown } = await this.txFlow.discard(token);
-      if ((verify || wasRelayUnknown) && this.activeWallet) {
-        try {
-          await this.activeWallet.setDaemonConnection(this.activeNodeUrl);
-          await this.activeWallet.refreshPool().catch(() => 0);
-          await this.syncController.syncOnce();
-          if (this.activeWallet) {
-            this.cachedBalances = await this.readBalances(this.activeWallet);
-          }
-        } catch {
-          // Best-effort pool refresh + sync verification after discard
+    const discarded = await this.enqueue(() => this.txFlow.discard(token));
+    if ((verify || discarded.wasRelayUnknown) && this.activeWallet) {
+      let verificationError: string | null = null;
+      try {
+        await this.activeWallet.setDaemonConnection(this.activeNodeUrl);
+        await this.activeWallet.refreshPool();
+        const syncStatus = await this.syncController.syncOnce();
+        if (syncStatus.state !== "synced") {
+          verificationError =
+            syncStatus.errorMessage ??
+            "Could not verify mempool or chain state because the node did not finish syncing";
+        } else if (this.activeWallet) {
+          this.cachedBalances = await this.readBalances(this.activeWallet);
+          await this.clearUnresolvedRelayMarkerInternal();
         }
+      } catch {
+        verificationError =
+          "Transaction discarded, but mempool/chain verification failed — sync the wallet before sending again";
       }
+      if (verificationError) {
+        if (!this.unresolvedRelay && discarded.txHashes.length > 0) {
+          await this.persistUnresolvedRelayMarker({
+            txHashes: discarded.txHashes,
+            recordedAt: Date.now(),
+            nodeHost: discarded.nodeHost || validateNodeUrl(this.activeNodeUrl).host,
+            reason: "VERIFY_FAILED"
+          });
+        } else {
+          await this.emitSnapshot();
+        }
+        throw new TxFlowError("VERIFICATION_FAILED", verificationError);
+      }
+    }
+    return await this.emitSnapshot();
+  }
+
+  async clearUnresolvedRelay(): Promise<WalletSnapshot> {
+    return this.enqueue(async () => {
+      await this.clearUnresolvedRelayMarkerInternal();
       return await this.emitSnapshot();
     });
   }
@@ -1302,9 +1627,11 @@ export class WalletEngine {
     readonly reserve?: ReserveStatusDto | null;
     readonly daemonHeight?: number;
   }): void {
+    this.sessionGeneration += 1;
     this.activeWallet = params.wallet;
-    this.activeEntry = params.entry;
+    this.activeEntry = toActiveWalletInfo(params.entry);
     this.dekKey = params.dekKey;
+    this.unresolvedRelay = null;
     this.cachedBalances =
       params.balances ??
       V2_ASSET_CODES.map((asset) => ({
@@ -1321,33 +1648,41 @@ export class WalletEngine {
   }
 
   async lockWallet(): Promise<WalletSnapshot> {
+    // Wait for any in-flight post-relay persistence barrier (and its enclosing relay finalize) before locking.
     if (this.postRelaySavePromise) {
       await this.postRelaySavePromise;
+      if (this.activeRelayOp) {
+        await this.activeRelayOp;
+      }
     }
-    return this.enqueue(async () => {
-      if (this.postRelaySavePromise) {
-        await this.postRelaySavePromise;
+    if (this.relayBusy || this.txFlow.isRelayInFlight()) {
+      throw new TxFlowError(
+        "LOCK_DEFERRED",
+        "Cannot lock wallet while a transaction relay is in flight."
+      );
+    }
+    if (this.persistFailure && this.activeWallet && this.activeEntry && this.dekKey) {
+      try {
+        await this.persistPostRelayBlobs(this.persistFailure.txHashes);
+      } catch {
+        throw new TxFlowError(
+          "LOCK_DEFERRED",
+          "Cannot lock wallet while post-relay wallet state has not been saved to disk. Retry saving first."
+        );
       }
-      if (this.persistFailure && this.activeWallet && this.activeEntry && this.dekKey) {
-        try {
-          await this.persistPostRelayBlobs(this.persistFailure.txHashes);
-        } catch {
-          throw new TxFlowError(
-            "LOCK_DEFERRED",
-            "Cannot lock wallet while post-relay wallet state has not been saved to disk. Retry saving first."
-          );
-        }
-      }
-      await this.closeActiveWalletInternal(true);
-      return await this.emitSnapshot();
-    });
+    }
+    // Pre-empt any running background or manual sync without waiting on the sync loop.
+    await this.closeActiveWalletInternal(true);
+    return await this.emitSnapshot();
   }
 
   async resetVault(): Promise<WalletSnapshot> {
     return this.enqueue(async () => {
       this.persistFailure = null;
+      this.unresolvedRelay = null;
       await this.closeActiveWalletInternal(false);
       await this.store.clearAll();
+      this.hasVaultCached = false;
       this.lastPersistedAt = null;
       return await this.emitSnapshot();
     });
@@ -1357,6 +1692,7 @@ export class WalletEngine {
     if (this.postRelaySavePromise) {
       await this.postRelaySavePromise;
     }
+    const wasSyncing = this.syncBusy || this.syncController.isSyncing();
     await this.txFlow.detach();
     this.syncController.stop();
     this.reserveService.resetForNodeSwitch();
@@ -1365,14 +1701,24 @@ export class WalletEngine {
     const entry = this.activeEntry;
     const dekKey = this.dekKey;
 
-    if (wallet && persistBeforeClose && entry && dekKey) {
+    // Attempt a bounded final checkpoint only when no WASM sync is hogging the worker queue.
+    if (wallet && persistBeforeClose && !wasSyncing && entry && dekKey) {
+      let timer: ReturnType<typeof setTimeout> | undefined;
       try {
-        await this.persistActiveWalletBlobs(wallet, entry.id, dekKey, "checkpoint");
+        await Promise.race([
+          this.persistActiveWalletBlobs(wallet, entry.id, dekKey, "checkpoint"),
+          new Promise<void>((resolve) => {
+            timer = setTimeout(resolve, this.lockCheckpointTimeoutMs);
+          })
+        ]);
       } catch {
         // Proceed to close/terminate even if final checkpoint fails on lock
+      } finally {
+        if (timer !== undefined) clearTimeout(timer);
       }
     }
 
+    this.sessionGeneration += 1;
     this.activeWallet = null;
     this.activeManifest = null;
     this.activeEntry = null;
@@ -1380,22 +1726,38 @@ export class WalletEngine {
     this.kdf = null;
     this.dekKey = null;
     this.persistFailure = null;
+    this.unresolvedRelay = null;
     this.cachedBalances = [];
     this.emitBusyState();
 
     if (wallet) {
-      await this.safeCloseOrTerminate(wallet);
+      await this.safeCloseOrTerminate(wallet, wasSyncing);
     }
   }
 
-  private async safeCloseOrTerminate(wallet: ZephyrWallet): Promise<void> {
+  private async safeCloseOrTerminate(
+    wallet: ZephyrWallet,
+    forceTerminate = false
+  ): Promise<void> {
     if (wallet.isClosed()) return;
-    const timeout = new Promise<"timeout">((resolve) => setTimeout(() => resolve("timeout"), 2000));
+    if (forceTerminate && wallet.proxied) {
+      try {
+        await wallet.terminate();
+      } catch {
+        // Best-effort worker termination
+      }
+      return;
+    }
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<"timeout">((resolve) => {
+      timer = setTimeout(() => resolve("timeout"), this.closeTimeoutMs);
+    });
     const closed = wallet.close().then(
       () => "closed" as const,
       () => "failed" as const
     );
     const outcome = await Promise.race([closed, timeout]);
+    if (timer !== undefined) clearTimeout(timer);
     if (outcome !== "closed" && wallet.proxied) {
       try {
         await wallet.terminate();
