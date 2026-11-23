@@ -25,18 +25,27 @@ Non-custodial TypeScript wallet for the Zephyr Protocol (`ZPH`, `ZSD`, `ZRS`,
 corepack pnpm install --frozen-lockfile
 corepack pnpm typecheck
 corepack pnpm check:ui-safety
-corepack pnpm test
 corepack pnpm build:extension
+corepack pnpm check:security
+corepack pnpm test
+corepack pnpm package:extension
 ```
 
 Extension builds emit:
 - `apps/extension/dist/chrome/`
 - `apps/extension/dist/firefox/`
 
+Reproducible production archives (`corepack pnpm package:extension`) emit:
+- `apps/extension/release/lateo-wallet-chrome-v0.1.0.zip`
+- `apps/extension/release/lateo-wallet-firefox-v0.1.0.zip`
+- `apps/extension/release/SHA256SUMS`
+
+See [`docs/BUILD.md`](docs/BUILD.md) for reproducible build and verification instructions.
+
 ## Security invariants
 
 - Zero `{@html}`, zero runtime `<style>` injection, and zero inline `style=`
-  attributes in UI components (`pnpm check:ui-safety`).
+  attributes in UI components (`pnpm check:ui-safety` and `pnpm check:security`).
 - Strict Manifest V3 Content Security Policy (`script-src 'self'
   'wasm-unsafe-eval'; style-src 'self'; object-src 'none'`).
 - `@loki-notfound/zephyr-ts` is installed from its signed GitHub release

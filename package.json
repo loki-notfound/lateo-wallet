@@ -10,10 +10,12 @@
   "scripts": {
     "typecheck": "corepack pnpm -r typecheck",
     "check:ui-safety": "node scripts/check-ui-safety.mjs",
+    "check:security": "node scripts/check-security.mjs",
     "test": "vitest run",
     "build:extension:chrome": "corepack pnpm --filter @lateo-wallet/extension build:chrome",
     "build:extension:firefox": "corepack pnpm --filter @lateo-wallet/extension build:firefox",
     "build:extension": "corepack pnpm build:extension:chrome && corepack pnpm build:extension:firefox",
+    "package:extension": "node scripts/package-extension.mjs",
     "verify:extension": "node apps/extension/scripts/verify-mv3.mjs"
   },
   "devDependencies": {
