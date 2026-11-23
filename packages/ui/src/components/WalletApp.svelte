@@ -26,6 +26,7 @@
   interface Props {
     client: WalletClient;
     surface: SurfaceMode;
+    defaultNodeUrl?: string;
     onOpenFullTab?: () => void;
     onOpenSidePanel?: () => void;
     onThemeApplied?: (theme: WalletPrefs["theme"]) => void;
@@ -35,6 +36,7 @@
   let {
     client,
     surface,
+    defaultNodeUrl,
     onOpenFullTab,
     onOpenSidePanel,
     onThemeApplied,
@@ -713,6 +715,7 @@
                 {client}
                 {prefs}
                 activeNodeUrl={snapshot.sync.nodeUrl}
+                {...(defaultNodeUrl ? { defaultNodeUrl } : {})}
                 walletName={snapshot.activeWallet.name}
                 viewOnly={snapshot.activeWallet.viewOnly}
                 onPrefsUpdated={handlePrefsUpdated}

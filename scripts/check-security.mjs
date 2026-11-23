@@ -25,6 +25,8 @@ const ROOT = path.resolve(import.meta.dirname, "..");
 const EXT_DIST = path.join(ROOT, "apps", "extension", "dist");
 const CHROME_DIST = path.join(EXT_DIST, "chrome");
 const FIREFOX_DIST = path.join(EXT_DIST, "firefox");
+const WEB_DIR = path.join(ROOT, "apps", "web");
+const WEB_DIST = path.join(WEB_DIR, "dist");
 
 const EXPECTED_ZEPHYR_TARBALL =
   "https://github.com/loki-notfound/myzephyr-ts/releases/download/v2.3.0-sec.2-ts.2/loki-notfound-zephyr-ts-2.3.0-sec.2-ts.2.tgz";
@@ -117,6 +119,16 @@ function ensureBuiltDist() {
       cwd: ROOT,
       stdio: "inherit"
     });
+  }
+  if (fs.existsSync(path.join(WEB_DIR, "package.json"))) {
+    const webIndex = path.join(WEB_DIST, "index.html");
+    if (!fs.existsSync(webIndex)) {
+      console.log("Web PWA build output missing; running corepack pnpm build:web...");
+      execFileSync("corepack", ["pnpm", "build:web"], {
+        cwd: ROOT,
+        stdio: "inherit"
+      });
+    }
   }
 }
 
@@ -548,6 +560,122 @@ function auditSupplyChainLockfiles() {
   }
 }
 
+function auditWebDist(distDir) {
+  if (!fs.existsSync(path.join(WEB_DIR, "package.json"))) {
+    return;
+  }
+
+  const files = walkFiles(distDir);
+  if (files.length === 0) {
+    fail("web-dist", "apps/web/dist directory is empty");
+    return;
+  }
+
+  // 1. Zero sourcemaps
+  for (const file of files) {
+    const rel = path.relative(ROOT, file);
+    if (file.endsWith(".map")) {
+      fail("no-sourcemaps", `web: sourcemap file found in build output: ${rel}`);
+    }
+  }
+
+  // 2. Deduplicated local WASM and worker assets (exact count === 1 each)
+  const assetsDir = path.join(distDir, "assets");
+  const assetEntries = fs.existsSync(assetsDir) ? fs.readdirSync(assetsDir) : [];
+  const wasmFiles = assetEntries.filter((n) => /^zephyr-[A-Za-z0-9_-]+\.wasm$/.test(n));
+  const workerFiles = assetEntries.filter((n) => /^zephyr\.worker-[A-Za-z0-9_-]+\.js$/.test(n));
+  if (wasmFiles.length !== 1) {
+    fail(
+      "web-wasm-bundle",
+      `web: expected exactly 1 deduplicated zephyr-*.wasm in apps/web/dist/assets, found ${wasmFiles.length}`
+    );
+  }
+  if (workerFiles.length !== 1) {
+    fail(
+      "web-wasm-bundle",
+      `web: expected exactly 1 deduplicated zephyr.worker-*.js in apps/web/dist/assets, found ${workerFiles.length}`
+    );
+  }
+
+  // 3. Required vendored PWA icons and manifest
+  const requiredStaticFiles = [
+    "index.html",
+    "manifest.webmanifest",
+    "favicon.svg",
+    "favicon-32.png",
+    "icon-192.png",
+    "icon-512.png",
+    "icon-maskable-512.png"
+  ];
+  for (const reqFile of requiredStaticFiles) {
+    if (!fs.existsSync(path.join(distDir, reqFile))) {
+      fail("web-pwa-assets", `web: missing required static asset apps/web/dist/${reqFile}`);
+    }
+  }
+
+  const manifestPath = path.join(distDir, "manifest.webmanifest");
+  if (fs.existsSync(manifestPath)) {
+    try {
+      const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
+      const icons = Array.isArray(manifest.icons) ? manifest.icons : [];
+      if (icons.length === 0) {
+        fail("web-pwa-manifest", "web: manifest.webmanifest has no icons");
+      }
+      for (const icon of icons) {
+        const src = typeof icon?.src === "string" ? icon.src : "";
+        if (!src || /^(?:https?:)?\/\//i.test(src)) {
+          fail("web-pwa-manifest", `web: manifest.webmanifest icon has non-local src "${src}"`);
+        } else {
+          const resolvedIcon = path.resolve(distDir, src.replace(/^\.\//, ""));
+          if (!fs.existsSync(resolvedIcon)) {
+            fail(
+              "web-pwa-manifest",
+              `web: manifest.webmanifest references missing icon "${src}"`
+            );
+          }
+        }
+      }
+    } catch (err) {
+      fail("web-pwa-manifest", `web: invalid JSON in manifest.webmanifest (${err.message})`);
+    }
+  }
+
+  // 4. Built HTML & CSS hygiene: zero <style>, zero inline style=, zero remote URLs
+  for (const file of files) {
+    const rel = path.relative(ROOT, file);
+    const ext = path.extname(file);
+    if (ext === ".html") {
+      const html = fs.readFileSync(file, "utf8");
+      if (/<style\b/i.test(html)) {
+        fail("web-html-csp", `${rel}: <style> tag found in built HTML`);
+      }
+      if (/\bstyle\s*=/i.test(html)) {
+        fail("web-html-csp", `${rel}: inline style= attribute found in built HTML`);
+      }
+      for (const ref of extractHtmlReferencedAssets(html)) {
+        if (/^(?:https?:)?\/\//i.test(ref)) {
+          fail("no-remote-assets", `${rel}: remote URL "${ref}" referenced in built HTML`);
+        }
+      }
+    } else if (ext === ".css") {
+      const css = fs.readFileSync(file, "utf8");
+      const importRegex = /@import\s+(?:url\s*\(\s*)?["']?([^"')\s]+)["']?\s*\)?/gi;
+      let match;
+      while ((match = importRegex.exec(css)) !== null) {
+        if (/^(?:https?:)?\/\//i.test(match[1])) {
+          fail("no-remote-assets", `${rel}: remote @import URL "${match[1]}" in built CSS`);
+        }
+      }
+      const urlRegex = /\burl\s*\(\s*["']?([^"')\s]+)["']?\s*\)/gi;
+      while ((match = urlRegex.exec(css)) !== null) {
+        if (/^(?:https?:)?\/\//i.test(match[1])) {
+          fail("no-remote-assets", `${rel}: remote url("${match[1]}") in built CSS`);
+        }
+      }
+    }
+  }
+}
+
 function main() {
   runUiSafetyCheck();
   ensureBuiltDist();
@@ -555,6 +683,7 @@ function main() {
   auditManifest("firefox", FIREFOX_DIST);
   auditBundleIsolationAndAssets("chrome", CHROME_DIST);
   auditBundleIsolationAndAssets("firefox", FIREFOX_DIST);
+  auditWebDist(WEB_DIST);
   auditSupplyChainLockfiles();
 
   if (failures > 0) {
@@ -563,7 +692,7 @@ function main() {
   }
 
   console.log(
-    "check:security OK (UI safety, MV3 manifests & strict CSP, bundle WASM isolation, zero sourcemaps, zero remote URLs, and supply-chain lockfile pins verified)"
+    "check:security OK (UI safety, MV3 manifests & strict CSP, bundle WASM isolation, Web PWA asset hygiene, zero sourcemaps, zero remote URLs, and supply-chain lockfile pins verified)"
   );
 }
 

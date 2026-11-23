@@ -11,6 +11,7 @@
     client: WalletClient;
     prefs: WalletPrefs;
     activeNodeUrl?: string;
+    defaultNodeUrl?: string;
     onPrefsUpdated: (next: WalletPrefs) => void;
     onSwitched: (snapshot: WalletSnapshot) => void;
     onRequestOriginPermission?: (originPattern: string) => Promise<boolean>;
@@ -20,6 +21,7 @@
     client,
     prefs,
     activeNodeUrl,
+    defaultNodeUrl,
     onPrefsUpdated,
     onSwitched,
     onRequestOriginPermission
@@ -31,13 +33,19 @@
   let errorMsg = $state<string | null>(null);
   let successMsg = $state<string | null>(null);
 
+  const primaryDefaultNode = $derived(defaultNodeUrl ?? DEFAULT_PUBLIC_NODE_URL);
   const effectiveActiveNode = $derived(activeNodeUrl ?? prefs.activePublicNode);
 
   const savedNodes = $derived.by(() => {
-    const list = [
-      DEFAULT_PUBLIC_NODE_URL,
-      ...prefs.customNodes.filter((u) => u !== DEFAULT_PUBLIC_NODE_URL)
-    ];
+    const list: string[] = [primaryDefaultNode];
+    if (DEFAULT_PUBLIC_NODE_URL !== primaryDefaultNode) {
+      list.push(DEFAULT_PUBLIC_NODE_URL);
+    }
+    for (const u of prefs.customNodes) {
+      if (!list.includes(u)) {
+        list.push(u);
+      }
+    }
     if (effectiveActiveNode && !list.includes(effectiveActiveNode)) {
       list.push(effectiveActiveNode);
     }
@@ -119,8 +127,8 @@
     <div>
       <h2 class="lt-panel-title">Zephyr daemon node</h2>
       <p class="lt-panel-subtitle">
-        Default: <code>https://node.lateo.dev</code> (restricted RPC). Remote custom nodes must use
-        HTTPS; plain HTTP is allowed for localhost only.
+        Default: <code><bdi>{primaryDefaultNode}</bdi></code> (restricted RPC). Remote custom nodes
+        must use HTTPS; plain HTTP is allowed for localhost only.
       </p>
     </div>
   </div>
@@ -155,7 +163,7 @@
             class="lt-btn lt-btn-secondary"
             disabled={busy}
             onclick={() => handleProbe(nodeUrl)}
-            data-testid={`probe-saved-${nodeUrl === DEFAULT_PUBLIC_NODE_URL ? "default" : "custom"}`}
+            data-testid={`probe-saved-${nodeUrl === primaryDefaultNode ? "default" : "custom"}`}
           >
             Test
           </button>

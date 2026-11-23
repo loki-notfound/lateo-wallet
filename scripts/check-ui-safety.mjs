@@ -13,12 +13,13 @@
 import fs from "node:fs";
 import path from "node:path";
 
-const ROOTS = ["packages/ui/src", "apps/extension/src"];
+const ROOTS = ["packages/ui/src", "apps/extension/src", "apps/web/src"];
 const EXTRA_FILES = [
   "apps/extension/popup.html",
   "apps/extension/panel.html",
   "apps/extension/app.html",
-  "apps/extension/offscreen.html"
+  "apps/extension/offscreen.html",
+  "apps/web/index.html"
 ];
 const EXTENSIONS = new Set([".svelte", ".ts", ".js", ".html"]);
 

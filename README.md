@@ -13,6 +13,9 @@ Non-custodial TypeScript wallet for the Zephyr Protocol (`ZPH`, `ZSD`, `ZRS`,
   public `@lateo/style` (`0.2.0`) stylesheets and assets.
 - `apps/extension`: Manifest V3 browser extension for Chrome/Chromium and
   Firefox (plain Vite multi-entry build + deterministic manifest generator).
+- `apps/web`: Installable Progressive Web App (`https://wallet.lateo.dev`,
+  plain Vite build, origin IndexedDB vault, strict document & worker CSP, and
+  same-origin `/rpc` proxy support).
 
 ## Requirements
 
@@ -26,9 +29,12 @@ corepack pnpm install --frozen-lockfile
 corepack pnpm typecheck
 corepack pnpm check:ui-safety
 corepack pnpm build:extension
+corepack pnpm build:web
 corepack pnpm check:security
 corepack pnpm test
 corepack pnpm package:extension
+corepack pnpm verify:extension
+corepack pnpm verify:web
 ```
 
 Extension builds emit:

@@ -19,6 +19,7 @@
     client: WalletClient;
     prefs: WalletPrefs;
     activeNodeUrl?: string;
+    defaultNodeUrl?: string;
     walletName: string;
     viewOnly: boolean;
     onPrefsUpdated: (next: WalletPrefs) => void;
@@ -31,6 +32,7 @@
     client,
     prefs,
     activeNodeUrl,
+    defaultNodeUrl,
     walletName,
     viewOnly,
     onPrefsUpdated,
@@ -175,6 +177,7 @@
     {client}
     {prefs}
     {...(activeNodeUrl ? { activeNodeUrl } : {})}
+    {...(defaultNodeUrl ? { defaultNodeUrl } : {})}
     {onPrefsUpdated}
     onSwitched={onNodeSwitched}
     {...(onRequestOriginPermission ? { onRequestOriginPermission } : {})}
