@@ -24,12 +24,21 @@ import {
 import { IndexedDbVaultStore } from "@lateo-wallet/core/idb";
 import { validateNodeUrl } from "@lateo-wallet/core/node-url";
 import { resolveWebDefaultNodeUrl } from "./default-node.js";
-import { WebPrefsStore } from "./prefs-store.js";
+import { WEB_PREFS_STORAGE_KEY, WebPrefsStore } from "./prefs-store.js";
 
 const ACTIVITY_EVENTS = ["pointerdown", "keydown", "touchstart", "wheel"] as const;
 const ACTIVITY_THROTTLE_MS = 5_000;
 const DEFAULT_DEFER_RETRY_MS = 15_000;
 const MAX_AUTO_LOCK_DEFERRALS = 15;
+export const WEB_TAB_LOCK_NAME = "lateo-wallet-active-engine";
+
+export interface LockManagerLike {
+  request(
+    name: string,
+    options: { readonly mode?: "exclusive" | "shared"; readonly ifAvailable?: boolean },
+    callback: (lock: unknown | null) => Promise<void> | void
+  ): Promise<void>;
+}
 
 export class WebClientError extends Error {
   readonly code: string;
@@ -58,6 +67,7 @@ export interface WebWalletClientOptions {
   readonly defaultNodeUrl?: string;
   readonly windowTarget?: WindowEventTargetLike | null;
   readonly documentTarget?: DocumentVisibilityTargetLike | null;
+  readonly lockManager?: LockManagerLike | null;
   readonly deferRetryMs?: number;
   readonly engineOptions?: Partial<
     Omit<WalletEngineOptions, "store" | "hostKind" | "onSnapshot" | "defaultNodeUrl">
@@ -98,6 +108,7 @@ export class WebWalletClient implements WalletClient {
   private readonly prefsStore: WebPrefsStore;
   private readonly windowTarget: WindowEventTargetLike | null;
   private readonly documentTarget: DocumentVisibilityTargetLike | null;
+  private readonly lockManager: LockManagerLike | null;
   private readonly deferRetryMs: number;
   private readonly listeners = new Set<(snapshot: WalletSnapshot) => void>();
 
@@ -107,10 +118,13 @@ export class WebWalletClient implements WalletClient {
   private autoLockDeferrals = 0;
   private lastActivityAt = 0;
   private disposed = false;
+  private releaseTabLockFn: (() => void) | null = null;
+  private tabLockAcquirePromise: Promise<void> | null = null;
 
   private readonly handleActivityBound: EventListener;
   private readonly handleBeforeUnloadBound: EventListener;
   private readonly handleVisibilityChangeBound: EventListener;
+  private readonly handleStorageBound: EventListener;
 
   constructor(options: WebWalletClientOptions = {}) {
     this.defaultNodeUrl = options.defaultNodeUrl ?? resolveWebDefaultNodeUrl();
@@ -127,6 +141,14 @@ export class WebWalletClient implements WalletClient {
         ? options.documentTarget
         : typeof document !== "undefined"
           ? document
+          : null;
+    this.lockManager =
+      options.lockManager !== undefined
+        ? options.lockManager
+        : typeof navigator !== "undefined" &&
+            navigator.locks &&
+            typeof navigator.locks.request === "function"
+          ? (navigator.locks as unknown as LockManagerLike)
           : null;
     this.deferRetryMs = options.deferRetryMs ?? DEFAULT_DEFER_RETRY_MS;
 
@@ -154,15 +176,100 @@ export class WebWalletClient implements WalletClient {
     this.handleVisibilityChangeBound = () => {
       this.onVisibilityChange();
     };
+    this.handleStorageBound = (event: Event) => {
+      this.onStorageChange(event as StorageEvent);
+    };
 
     if (this.windowTarget) {
       for (const evt of ACTIVITY_EVENTS) {
         this.windowTarget.addEventListener(evt, this.handleActivityBound);
       }
       this.windowTarget.addEventListener("beforeunload", this.handleBeforeUnloadBound);
+      this.windowTarget.addEventListener("storage", this.handleStorageBound);
     }
     if (this.documentTarget) {
       this.documentTarget.addEventListener("visibilitychange", this.handleVisibilityChangeBound);
+    }
+  }
+
+  private async acquireExclusiveTabLock(): Promise<void> {
+    if (!this.lockManager || this.releaseTabLockFn !== null) {
+      return;
+    }
+    if (this.tabLockAcquirePromise) {
+      return this.tabLockAcquirePromise;
+    }
+    const acquirePromise = new Promise<void>((resolve, reject) => {
+      let settled = false;
+      const done = (ok: boolean): void => {
+        if (settled) return;
+        settled = true;
+        if (ok) {
+          resolve();
+        } else {
+          reject(
+            new WebClientError(
+              "MULTI_TAB_LOCKED",
+              "Lateo Wallet is already unlocked in another tab. Lock or close the other tab before continuing here."
+            )
+          );
+        }
+      };
+
+      try {
+        const reqPromise = this.lockManager!.request(
+          WEB_TAB_LOCK_NAME,
+          { mode: "exclusive", ifAvailable: true },
+          (lock) => {
+            if (!lock) {
+              done(false);
+              return;
+            }
+            return new Promise<void>((release) => {
+              this.releaseTabLockFn = () => {
+                this.releaseTabLockFn = null;
+                release();
+              };
+              done(true);
+            });
+          }
+        );
+        void Promise.resolve(reqPromise).catch(() => {
+          done(false);
+        });
+      } catch {
+        done(false);
+      }
+    });
+    this.tabLockAcquirePromise = acquirePromise;
+    try {
+      await acquirePromise;
+    } finally {
+      if (this.tabLockAcquirePromise === acquirePromise) {
+        this.tabLockAcquirePromise = null;
+      }
+    }
+  }
+
+  private releaseExclusiveTabLock(): void {
+    if (this.releaseTabLockFn) {
+      const fn = this.releaseTabLockFn;
+      this.releaseTabLockFn = null;
+      fn();
+    }
+  }
+
+  private onStorageChange(event: StorageEvent): void {
+    if (this.disposed) return;
+    if (event.key !== null && event.key !== WEB_PREFS_STORAGE_KEY) return;
+    const synced = this.prefsStore.readPrefsSync();
+    this.autoLockMinutes = synced.autoLockMinutes;
+    if (this.lastSnapshot && !this.lastSnapshot.locked) {
+      if (this.isIdleDeadlineElapsed(Date.now())) {
+        void this.handleAutoLockFire();
+      } else {
+        this.armAutoLock();
+      }
     }
   }
 
@@ -173,6 +280,9 @@ export class WebWalletClient implements WalletClient {
     if (snapshot.locked) {
       this.clearAutoLockTimer();
       this.autoLockDeferrals = 0;
+      if (wasUnlocked) {
+        this.releaseExclusiveTabLock();
+      }
     } else if (!wasUnlocked) {
       this.lastActivityAt = Date.now();
       this.autoLockDeferrals = 0;
@@ -192,6 +302,7 @@ export class WebWalletClient implements WalletClient {
     return (
       Boolean(this.lastSnapshot?.savingState) ||
       Boolean(this.lastSnapshot?.persistFailure) ||
+      this.lastSnapshot?.pendingTx?.status === "relay-unknown" ||
       this.engine.isSavingOrRelayCritical()
     );
   }
@@ -275,7 +386,10 @@ export class WebWalletClient implements WalletClient {
       return;
     }
 
-    if (this.engine.isSavingOrRelayCritical()) {
+    if (
+      this.engine.isSavingOrRelayCritical() ||
+      this.lastSnapshot.pendingTx?.status === "relay-unknown"
+    ) {
       if (this.autoLockDeferrals < MAX_AUTO_LOCK_DEFERRALS) {
         this.autoLockDeferrals += 1;
         this.armAutoLock(this.deferRetryMs);
@@ -286,6 +400,7 @@ export class WebWalletClient implements WalletClient {
     try {
       await this.engine.lockWallet();
       this.autoLockDeferrals = 0;
+      this.releaseExclusiveTabLock();
     } catch {
       // e.g. LOCK_DEFERRED if a relay started right as the timer fired — retry soon.
       if (!this.disposed && this.lastSnapshot && !this.lastSnapshot.locked) {
@@ -305,6 +420,9 @@ export class WebWalletClient implements WalletClient {
       }
       return result;
     } catch (err) {
+      if (err instanceof WebClientError) {
+        throw err;
+      }
       throw mapEngineError(err);
     }
   }
@@ -312,12 +430,14 @@ export class WebWalletClient implements WalletClient {
   dispose(): void {
     this.disposed = true;
     this.clearAutoLockTimer();
+    this.releaseExclusiveTabLock();
     this.listeners.clear();
     if (this.windowTarget) {
       for (const evt of ACTIVITY_EVENTS) {
         this.windowTarget.removeEventListener(evt, this.handleActivityBound);
       }
       this.windowTarget.removeEventListener("beforeunload", this.handleBeforeUnloadBound);
+      this.windowTarget.removeEventListener("storage", this.handleStorageBound);
     }
     if (this.documentTarget) {
       this.documentTarget.removeEventListener("visibilitychange", this.handleVisibilityChangeBound);
@@ -363,12 +483,25 @@ export class WebWalletClient implements WalletClient {
     return updated;
   }
 
+  private async withExclusiveTabSession<T>(fn: () => Promise<T>): Promise<T> {
+    const heldBefore = this.releaseTabLockFn !== null;
+    await this.acquireExclusiveTabLock();
+    try {
+      return await fn();
+    } catch (err) {
+      if (!heldBefore && (!this.lastSnapshot || this.lastSnapshot.locked)) {
+        this.releaseExclusiveTabLock();
+      }
+      throw err;
+    }
+  }
+
   createWallet(params: {
     readonly password: string;
     readonly name: string;
     readonly network?: ZephyrNetwork;
   }): Promise<CreateWalletResultDto> {
-    return this.run(() => this.engine.createWallet(params));
+    return this.run(() => this.withExclusiveTabSession(() => this.engine.createWallet(params)));
   }
 
   restoreFromSeed(params: {
@@ -378,7 +511,7 @@ export class WebWalletClient implements WalletClient {
     readonly restoreHeight: number;
     readonly network?: ZephyrNetwork;
   }): Promise<WalletSnapshot> {
-    return this.run(() => this.engine.restoreFromSeed(params));
+    return this.run(() => this.withExclusiveTabSession(() => this.engine.restoreFromSeed(params)));
   }
 
   restoreViewOnly(params: {
@@ -389,7 +522,7 @@ export class WebWalletClient implements WalletClient {
     readonly restoreHeight: number;
     readonly network?: ZephyrNetwork;
   }): Promise<WalletSnapshot> {
-    return this.run(() => this.engine.restoreViewOnly(params));
+    return this.run(() => this.withExclusiveTabSession(() => this.engine.restoreViewOnly(params)));
   }
 
   markSeedBackupVerified(): Promise<WalletSnapshot> {
@@ -397,7 +530,7 @@ export class WebWalletClient implements WalletClient {
   }
 
   unlockWallet(password: string): Promise<WalletSnapshot> {
-    return this.run(() => this.engine.unlockWallet(password));
+    return this.run(() => this.withExclusiveTabSession(() => this.engine.unlockWallet(password)));
   }
 
   lockWallet(): Promise<WalletSnapshot> {
@@ -405,6 +538,7 @@ export class WebWalletClient implements WalletClient {
       const snap = await this.engine.lockWallet();
       this.clearAutoLockTimer();
       this.autoLockDeferrals = 0;
+      this.releaseExclusiveTabLock();
       return snap;
     }, false);
   }
@@ -422,14 +556,19 @@ export class WebWalletClient implements WalletClient {
 
   resetVault(): Promise<WalletSnapshot> {
     return this.run(async () => {
-      await this.engine.resetVault();
-      this.clearAutoLockTimer();
-      this.autoLockDeferrals = 0;
-      await this.prefsStore.writePrefs({
-        activePublicNode: this.defaultNodeUrl,
-        customNodes: []
-      });
-      return await this.engine.setActiveNode(this.defaultNodeUrl);
+      await this.acquireExclusiveTabLock();
+      try {
+        await this.engine.resetVault();
+        this.clearAutoLockTimer();
+        this.autoLockDeferrals = 0;
+        await this.prefsStore.writePrefs({
+          activePublicNode: this.defaultNodeUrl,
+          customNodes: []
+        });
+        return await this.engine.setActiveNode(this.defaultNodeUrl);
+      } finally {
+        this.releaseExclusiveTabLock();
+      }
     }, false);
   }
 

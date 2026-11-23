@@ -694,4 +694,169 @@ describe("Security audit hardening regressions", () => {
     engine.setInitialNodeUrl("https://stale.example.org");
     expect((await engine.getSnapshot()).sync.nodeUrl).toBe("https://switched.example.org");
   });
+
+  it("P23-03: relayPrepared awaits atomic persistence of relay marker and wallet blobs before resolving", async () => {
+    const store = new ControlledVaultStore();
+    const { dekKey } = await generateDek();
+    let releaseAtomicWrite!: () => void;
+    let atomicStarted!: () => void;
+    const atomicStartedPromise = new Promise<void>((resolve) => {
+      atomicStarted = resolve;
+    });
+    const writtenKinds: string[] = [];
+    store.atomicWriteHook = async (blobs) => {
+      for (const b of blobs) writtenKinds.push(b.kind);
+      atomicStarted();
+      await new Promise<void>((resolve) => {
+        releaseAtomicWrite = resolve;
+      });
+    };
+
+    const fake = makeFakeWallet({
+      relayHandler: async () => {
+        throw new ZephyrWalletError("RELAY_UNKNOWN", "DAEMON_UNREACHABLE");
+      }
+    });
+    const engine = new WalletEngine({
+      store,
+      hostKind: "web-worker",
+      enableBackgroundSync: false,
+      validateAddressFn: async () => {}
+    });
+    const entry: WalletManifestEntry = {
+      id: "w-p23-03",
+      name: "Relay Marker Await",
+      network: "mainnet",
+      restoreHeight: 913_600,
+      restoreHeightSource: "daemon",
+      createdAt: "2026-11-23T00:00:00Z",
+      viewOnly: false,
+      seedBackupVerified: true,
+      corePassword: generateCorePassword(),
+      primaryAddress: ADDR_A
+    };
+    engine.attachTestWalletSession({
+      wallet: fake.wallet,
+      entry,
+      dekKey,
+      balances: [
+        { asset: "ZPH", total: "50000000000000", unlocked: "50000000000000", locked: "0" },
+        { asset: "ZSD", total: "0", unlocked: "0", locked: "0" },
+        { asset: "ZRS", total: "0", unlocked: "0", locked: "0" },
+        { asset: "ZYS", total: "0", unlocked: "0", locked: "0" }
+      ],
+      daemonHeight: 913_600
+    });
+
+    const prepared = await engine.prepareTransfer({
+      asset: "ZPH",
+      destinations: [{ address: ADDR_B, amount: "1.0" }]
+    });
+
+    let resolved = false;
+    const relayPromise = engine.relayPrepared(prepared.token).then((res) => {
+      resolved = true;
+      return res;
+    });
+
+    await atomicStartedPromise;
+    expect(resolved).toBe(false);
+    expect((await engine.getSnapshot()).savingState).toBe(true);
+    expect(writtenKinds).toContain("relay");
+    expect(writtenKinds).toContain("cache");
+
+    releaseAtomicWrite();
+    const outcome = await relayPromise;
+    expect(outcome.kind).toBe("relay-unknown");
+    expect(store.blobs.has("w-p23-03:relay")).toBe(true);
+    expect(store.blobs.has("w-p23-03:cache")).toBe(true);
+  });
+
+  it("P23-05: cold-start readMeta failure rejects getSnapshot instead of masking as hasVault: false", async () => {
+    const store = new ControlledVaultStore();
+    store.failReadMeta = true;
+    const engine = new WalletEngine({
+      store,
+      hostKind: "electron-renderer",
+      enableBackgroundSync: false
+    });
+    await expect(engine.getSnapshot()).rejects.toThrow(/readMeta failure/i);
+
+    // After a successful initialization read, transient readMeta errors are tolerated
+    store.failReadMeta = false;
+    expect((await engine.getSnapshot()).hasVault).toBe(false);
+    store.failReadMeta = true;
+    expect((await engine.getSnapshot()).hasVault).toBe(false);
+  });
+
+  it("P23-08: lockWallet throws LOCK_DEFERRED during conversion pre-flight daemon height refresh", async () => {
+    const store = new ControlledVaultStore();
+    const { dekKey } = await generateDek();
+    let releaseHeightProbe!: () => void;
+    let probeStarted!: () => void;
+    const probeStartedPromise = new Promise<void>((resolve) => {
+      probeStarted = resolve;
+    });
+
+    const fake = makeFakeWallet({
+      relayHandler: async () => ({
+        txs: [{ hash: TX_HASH, outcome: "accepted", notRelayed: false }],
+        complete: true
+      })
+    });
+
+    const engine = new WalletEngine({
+      store,
+      hostKind: "web-worker",
+      enableBackgroundSync: false,
+      validateAddressFn: async () => {},
+      fetchDaemonHeight: async () => {
+        probeStarted();
+        await new Promise<void>((resolve) => {
+          releaseHeightProbe = resolve;
+        });
+        return 913_600;
+      }
+    });
+    const entry: WalletManifestEntry = {
+      id: "w-p23-08",
+      name: "Conversion Pre-Flight Lock",
+      network: "mainnet",
+      restoreHeight: 913_600,
+      restoreHeightSource: "daemon",
+      createdAt: "2026-11-23T00:00:00Z",
+      viewOnly: false,
+      seedBackupVerified: true,
+      corePassword: generateCorePassword(),
+      primaryAddress: ADDR_A
+    };
+    engine.attachTestWalletSession({
+      wallet: fake.wallet,
+      entry,
+      dekKey,
+      balances: [
+        { asset: "ZPH", total: "50000000000000", unlocked: "50000000000000", locked: "0" },
+        { asset: "ZSD", total: "0", unlocked: "0", locked: "0" },
+        { asset: "ZRS", total: "0", unlocked: "0", locked: "0" },
+        { asset: "ZYS", total: "0", unlocked: "0", locked: "0" }
+      ],
+      reserve: makeHealthyReserve(913_600),
+      daemonHeight: 913_600
+    });
+
+    const prepared = await engine.prepareConversion({
+      sourceAsset: "ZPH",
+      destinationAsset: "ZSD",
+      amount: "1.0"
+    });
+
+    const relayPromise = engine.relayPrepared(prepared.token);
+    await probeStartedPromise;
+
+    await expect(engine.lockWallet()).rejects.toMatchObject({ code: "LOCK_DEFERRED" });
+
+    releaseHeightProbe();
+    const outcome = await relayPromise;
+    expect(outcome.kind).toBe("relayed");
+  });
 });

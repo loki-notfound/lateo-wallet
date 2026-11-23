@@ -17,7 +17,11 @@ import {
   WebPrefsStore,
   type KeyValueStorageLike
 } from "./prefs-store.js";
-import { WebWalletClient, type WindowEventTargetLike } from "./web-wallet-client.js";
+import {
+  WebWalletClient,
+  type LockManagerLike,
+  type WindowEventTargetLike
+} from "./web-wallet-client.js";
 
 const VALID_ADDR =
   "ZEPHYR3dc1432222222222222222222222222222222222222222222222222222222222222222222222222222222222222222";
@@ -392,6 +396,214 @@ describe("WebWalletClient lifecycle guards", () => {
       expect(resetSnap.sync.nodeUrl).toBe("https://wallet.lateo.dev/rpc");
       expect((await client.getPrefs()).activePublicNode).toBe("https://wallet.lateo.dev/rpc");
       expect((await client.getPrefs()).customNodes).toEqual([]);
+    } finally {
+      client.dispose();
+    }
+  });
+
+  it("P23-01: enforces exclusive Web Lock across concurrent tabs to prevent IndexedDB split-brain", async () => {
+    class SharedLockManager implements LockManagerLike {
+      private held = new Set<string>();
+      async request(
+        name: string,
+        options: { readonly mode?: "exclusive" | "shared"; readonly ifAvailable?: boolean },
+        callback: (lock: unknown | null) => Promise<void> | void
+      ): Promise<void> {
+        if (options.ifAvailable && this.held.has(name)) {
+          await callback(null);
+          return;
+        }
+        this.held.add(name);
+        try {
+          await callback({ name });
+        } finally {
+          this.held.delete(name);
+        }
+      }
+    }
+
+    const locks = new SharedLockManager();
+    const store = new ControlledStore();
+    const clientA = new WebWalletClient({
+      store,
+      prefsStore: new WebPrefsStore({
+        storage: new MemoryStorage(),
+        defaultNodeUrl: "https://wallet.lateo.dev/rpc"
+      }),
+      defaultNodeUrl: "https://wallet.lateo.dev/rpc",
+      windowTarget: null,
+      documentTarget: null,
+      lockManager: locks,
+      engineOptions: {
+        proxyToWorker: false,
+        enableBackgroundSync: false,
+        pbkdf2Iterations: 10_000,
+        fetchDaemonHeight: async () => null
+      }
+    });
+    const clientB = new WebWalletClient({
+      store,
+      prefsStore: new WebPrefsStore({
+        storage: new MemoryStorage(),
+        defaultNodeUrl: "https://wallet.lateo.dev/rpc"
+      }),
+      defaultNodeUrl: "https://wallet.lateo.dev/rpc",
+      windowTarget: null,
+      documentTarget: null,
+      lockManager: locks,
+      engineOptions: {
+        proxyToWorker: false,
+        enableBackgroundSync: false,
+        pbkdf2Iterations: 10_000,
+        fetchDaemonHeight: async () => null
+      }
+    });
+
+    try {
+      await clientA.createWallet({ password: "MultiTab-Pass!9", name: "Tab A" });
+      await expect(clientB.unlockWallet("MultiTab-Pass!9")).rejects.toMatchObject({
+        code: "MULTI_TAB_LOCKED"
+      });
+
+      await clientA.lockWallet();
+      const snapB = await clientB.unlockWallet("MultiTab-Pass!9");
+      expect(snapB.locked).toBe(false);
+    } finally {
+      clientA.dispose();
+      clientB.dispose();
+    }
+  }, 30_000);
+
+  it("P23-03: arms beforeunload and defers idle auto-lock while pendingTx is relay-unknown", async () => {
+    vi.useFakeTimers();
+    const storage = new MemoryStorage();
+    const prefsStore = new WebPrefsStore({
+      storage,
+      defaultNodeUrl: "https://wallet.lateo.dev/rpc"
+    });
+    const win = new FakeWindowTarget();
+    const store = new ControlledStore();
+    const client = new WebWalletClient({
+      store,
+      prefsStore,
+      defaultNodeUrl: "https://wallet.lateo.dev/rpc",
+      windowTarget: win,
+      documentTarget: null,
+      lockManager: null,
+      deferRetryMs: 5_000,
+      engineOptions: {
+        proxyToWorker: false,
+        enableBackgroundSync: false,
+        validateAddressFn: async () => {}
+      }
+    });
+
+    try {
+      await client.updatePrefs({ autoLockMinutes: 1 });
+      const { dekKey } = await generateDek();
+      const entry: WalletManifestEntry = {
+        id: "w-web-relay-unknown",
+        name: "Relay Unknown Test",
+        network: "mainnet",
+        restoreHeight: 913_600,
+        restoreHeightSource: "daemon",
+        createdAt: "2026-11-23T00:00:00Z",
+        viewOnly: false,
+        seedBackupVerified: true,
+        corePassword: generateCorePassword(),
+        primaryAddress: VALID_ADDR
+      };
+      const fakeWallet = {
+        proxied: false,
+        isClosed: () => false,
+        close: async () => {},
+        terminate: async () => {},
+        isViewOnly: async () => false,
+        getPrimaryAddress: async () => VALID_ADDR,
+        getHeight: async () => 913_600,
+        getDaemonHeight: async () => 913_600,
+        setDaemonConnection: async () => {},
+        getBalance: async () => new Map([["ZPH", 50_000_000_000_000n]]),
+        getUnlockedBalance: async () => new Map([["ZPH", 50_000_000_000_000n]]),
+        getData: async () => ({ keys: new Uint8Array([1, 2]), cache: new Uint8Array([3, 4]) }),
+        prepareTransfer: async (config: {
+          asset: string;
+          destinations: ReadonlyArray<{ address: string; amount: bigint }>;
+        }) => {
+          const total = config.destinations.reduce((acc, d) => acc + d.amount, 0n);
+          const fee = 10_000_000_000n;
+          return {
+            token: "core-token-unknown",
+            build: {
+              multipleTxs: false,
+              totalAmount: total,
+              totalFee: fee,
+              txs: [
+                {
+                  hash: TX_HASH,
+                  sourceAsset: config.asset,
+                  destinationAsset: config.asset,
+                  destinations: config.destinations.map((d) => ({
+                    address: d.address,
+                    amount: d.amount
+                  })),
+                  amount: total,
+                  fee,
+                  feeAsset: config.asset,
+                  totalDebited: total + fee,
+                  change: 0n,
+                  ringSize: 16,
+                  inputs: 1,
+                  outputs: 2,
+                  weight: 2000,
+                  unlockTime: 0n
+                }
+              ]
+            }
+          };
+        },
+        relayPrepared: async () => {
+          throw Object.assign(new Error("Daemon unreachable"), {
+            code: "RELAY_UNKNOWN",
+            diagnostic: "DAEMON_UNREACHABLE"
+          });
+        },
+        discardPrepared: async () => true
+      } as unknown as TestZephyrWallet;
+
+      client.engine.attachTestWalletSession({
+        wallet: fakeWallet,
+        entry,
+        dekKey,
+        balances: [
+          { asset: "ZPH", total: "50000000000000", unlocked: "50000000000000", locked: "0" },
+          { asset: "ZSD", total: "0", unlocked: "0", locked: "0" },
+          { asset: "ZRS", total: "0", unlocked: "0", locked: "0" },
+          { asset: "ZYS", total: "0", unlocked: "0", locked: "0" }
+        ],
+        daemonHeight: 913_600
+      });
+      await client.getSnapshot();
+
+      const prepared = await client.prepareTransfer({
+        asset: "ZPH",
+        destinations: [{ address: VALID_ADDR, amount: "1.0" }]
+      });
+      const outcome = await client.relayPrepared(prepared.token);
+      expect(outcome.kind).toBe("relay-unknown");
+
+      const ev = {
+        prevented: false,
+        returnValue: undefined as unknown,
+        preventDefault() {
+          this.prevented = true;
+        }
+      };
+      win.dispatch("beforeunload", ev as unknown as Event);
+      expect(ev.prevented).toBe(true);
+
+      await vi.advanceTimersByTimeAsync(65_000);
+      expect((await client.getSnapshot()).locked).toBe(false);
     } finally {
       client.dispose();
     }

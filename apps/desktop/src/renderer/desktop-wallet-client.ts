@@ -13,7 +13,9 @@ import {
   type RevealedSecretsDto,
   type SubaddressDto,
   type TxPriorityDto,
+  type VaultBlobStore,
   type WalletClient,
+  type WalletEngineOptions,
   type WalletPrefs,
   type WalletSnapshot,
   type WalletTxDto,
@@ -22,12 +24,42 @@ import {
 import { IndexedDbVaultStore } from "@lateo-wallet/core/idb";
 import { DEFAULT_PUBLIC_NODE_URL, validateNodeUrl } from "@lateo-wallet/core/node-url";
 import { sanitizeWalletPrefs } from "@lateo-wallet/core/prefs";
+import type { LateoDesktopBridge } from "../shared/bridge.js";
 
 const PREFS_STORAGE_KEY = "lateo_desktop_prefs_v1";
-const ACTIVITY_EVENTS = ["pointerdown", "keydown", "wheel"] as const;
+const ACTIVITY_EVENTS = ["pointerdown", "keydown", "touchstart", "wheel"] as const;
 const ACTIVITY_THROTTLE_MS = 5_000;
 const DEFER_RETRY_MS = 15_000;
 const MAX_AUTO_LOCK_DEFERRALS = 15;
+
+export interface DesktopWindowTargetLike {
+  addEventListener(type: string, listener: EventListenerOrEventListenerObject): void;
+  removeEventListener(type: string, listener: EventListenerOrEventListenerObject): void;
+}
+
+export interface DesktopDocumentTargetLike {
+  readonly visibilityState?: string;
+  addEventListener(type: string, listener: EventListenerOrEventListenerObject): void;
+  removeEventListener(type: string, listener: EventListenerOrEventListenerObject): void;
+}
+
+export interface DesktopKeyValueStorageLike {
+  getItem(key: string): string | null;
+  setItem(key: string, value: string): void;
+}
+
+export interface DesktopWalletClientOptions {
+  readonly store?: VaultBlobStore;
+  readonly storage?: DesktopKeyValueStorageLike | null;
+  readonly windowTarget?: DesktopWindowTargetLike | null;
+  readonly documentTarget?: DesktopDocumentTargetLike | null;
+  readonly bridge?: LateoDesktopBridge | null;
+  readonly offlineMode?: boolean;
+  readonly deferRetryMs?: number;
+  readonly engineOptions?: Partial<
+    Omit<WalletEngineOptions, "store" | "hostKind" | "onSnapshot" | "defaultNodeUrl">
+  >;
+}
 
 export class DesktopClientError extends Error {
   readonly code: string;
@@ -52,9 +84,20 @@ function mapEngineError(err: unknown): DesktopClientError {
   return new DesktopClientError("ENGINE_ERROR", "Operation failed");
 }
 
-function readDesktopPrefs(): WalletPrefs {
+function defaultDesktopStorage(): DesktopKeyValueStorageLike | null {
   try {
-    const raw = window.localStorage.getItem(PREFS_STORAGE_KEY);
+    return typeof window !== "undefined" && window.localStorage ? window.localStorage : null;
+  } catch {
+    return null;
+  }
+}
+
+function readDesktopPrefs(storage: DesktopKeyValueStorageLike | null): WalletPrefs {
+  if (!storage) {
+    return sanitizeWalletPrefs(undefined, DEFAULT_PUBLIC_NODE_URL);
+  }
+  try {
+    const raw = storage.getItem(PREFS_STORAGE_KEY);
     if (!raw) return sanitizeWalletPrefs(undefined, DEFAULT_PUBLIC_NODE_URL);
     const parsed = JSON.parse(raw) as Partial<WalletPrefs> | null;
     return sanitizeWalletPrefs(
@@ -66,8 +109,11 @@ function readDesktopPrefs(): WalletPrefs {
   }
 }
 
-function writeDesktopPrefs(patch: Partial<WalletPrefs>): WalletPrefs {
-  const current = readDesktopPrefs();
+function writeDesktopPrefs(
+  storage: DesktopKeyValueStorageLike | null,
+  patch: Partial<WalletPrefs>
+): WalletPrefs {
+  const current = readDesktopPrefs(storage);
   const next = sanitizeWalletPrefs(
     {
       theme: patch.theme !== undefined ? patch.theme : current.theme,
@@ -79,10 +125,12 @@ function writeDesktopPrefs(patch: Partial<WalletPrefs>): WalletPrefs {
     },
     DEFAULT_PUBLIC_NODE_URL
   );
-  try {
-    window.localStorage.setItem(PREFS_STORAGE_KEY, JSON.stringify(next));
-  } catch {
-    // Ignore storage quota errors
+  if (storage) {
+    try {
+      storage.setItem(PREFS_STORAGE_KEY, JSON.stringify(next));
+    } catch {
+      // Ignore storage quota errors
+    }
   }
   return next;
 }
@@ -93,7 +141,13 @@ function writeDesktopPrefs(patch: Partial<WalletPrefs>): WalletPrefs {
  */
 export class DesktopWalletClient implements WalletClient {
   readonly defaultNodeUrl = DEFAULT_PUBLIC_NODE_URL;
-  private readonly engine: WalletEngine;
+  readonly engine: WalletEngine;
+
+  private readonly storage: DesktopKeyValueStorageLike | null;
+  private readonly windowTarget: DesktopWindowTargetLike | null;
+  private readonly documentTarget: DesktopDocumentTargetLike | null;
+  private readonly bridge: LateoDesktopBridge | null;
+  private readonly deferRetryMs: number;
   private readonly listeners = new Set<(snapshot: WalletSnapshot) => void>();
 
   private lastSnapshot: WalletSnapshot | null = null;
@@ -102,18 +156,44 @@ export class DesktopWalletClient implements WalletClient {
   private autoLockDeferrals = 0;
   private lastActivityAt = 0;
   private disposed = false;
+  private unsubscribeSystemLock: (() => void) | null = null;
 
   private readonly handleActivityBound: EventListener;
   private readonly handleBeforeUnloadBound: EventListener;
+  private readonly handleVisibilityChangeBound: EventListener;
 
-  constructor() {
-    const initialPrefs = readDesktopPrefs();
+  constructor(options: DesktopWalletClientOptions = {}) {
+    this.storage = options.storage !== undefined ? options.storage : defaultDesktopStorage();
+    this.windowTarget =
+      options.windowTarget !== undefined
+        ? options.windowTarget
+        : typeof window !== "undefined"
+          ? window
+          : null;
+    this.documentTarget =
+      options.documentTarget !== undefined
+        ? options.documentTarget
+        : typeof document !== "undefined"
+          ? document
+          : null;
+    this.bridge =
+      options.bridge !== undefined
+        ? options.bridge
+        : typeof window !== "undefined"
+          ? (window.lateoDesktop ?? null)
+          : null;
+    this.deferRetryMs = options.deferRetryMs ?? DEFER_RETRY_MS;
+
+    const initialPrefs = readDesktopPrefs(this.storage);
     this.autoLockMinutes = initialPrefs.autoLockMinutes;
     const offlineMode =
-      typeof window !== "undefined" && new URLSearchParams(window.location.search).has("offline");
+      options.offlineMode ??
+      (typeof window !== "undefined" && new URLSearchParams(window.location.search).has("offline"));
+
+    void this.bridge?.authorizeNodeOrigin(initialPrefs.activePublicNode, "active").catch(() => {});
 
     this.engine = new WalletEngine({
-      store: new IndexedDbVaultStore(),
+      store: options.store ?? new IndexedDbVaultStore(),
       hostKind: "electron-renderer",
       proxyToWorker: true,
       defaultNodeUrl: initialPrefs.activePublicNode,
@@ -123,6 +203,7 @@ export class DesktopWalletClient implements WalletClient {
             fetchDaemonHeight: async () => null
           }
         : {}),
+      ...options.engineOptions,
       onSnapshot: (snapshot) => {
         this.onEngineSnapshot(snapshot);
       }
@@ -130,20 +211,56 @@ export class DesktopWalletClient implements WalletClient {
 
     this.handleActivityBound = () => this.onUserActivity();
     this.handleBeforeUnloadBound = (event: Event) => {
-      if (
-        Boolean(this.lastSnapshot?.savingState) ||
-        Boolean(this.lastSnapshot?.persistFailure) ||
-        this.engine.isSavingOrRelayCritical()
-      ) {
+      if (this.isCriticalSaveActive()) {
         event.preventDefault();
         (event as BeforeUnloadEvent).returnValue = "";
       }
     };
+    this.handleVisibilityChangeBound = () => {
+      this.onVisibilityChange();
+    };
 
-    for (const evt of ACTIVITY_EVENTS) {
-      window.addEventListener(evt, this.handleActivityBound);
+    if (this.windowTarget) {
+      for (const evt of ACTIVITY_EVENTS) {
+        this.windowTarget.addEventListener(evt, this.handleActivityBound);
+      }
+      this.windowTarget.addEventListener("beforeunload", this.handleBeforeUnloadBound);
     }
-    window.addEventListener("beforeunload", this.handleBeforeUnloadBound);
+    if (this.documentTarget) {
+      this.documentTarget.addEventListener("visibilitychange", this.handleVisibilityChangeBound);
+    }
+    if (this.bridge?.onSystemLockRequest) {
+      this.unsubscribeSystemLock = this.bridge.onSystemLockRequest(() => {
+        void this.handleAutoLockFire();
+      });
+    }
+  }
+
+  private isCriticalSaveActive(): boolean {
+    return (
+      Boolean(this.lastSnapshot?.savingState) ||
+      Boolean(this.lastSnapshot?.persistFailure) ||
+      this.lastSnapshot?.pendingTx?.status === "relay-unknown" ||
+      this.engine.isSavingOrRelayCritical()
+    );
+  }
+
+  private isIdleDeadlineElapsed(now: number): boolean {
+    if (this.lastActivityAt <= 0) return false;
+    const limitMs = Math.max(1, this.autoLockMinutes) * 60_000;
+    return now - this.lastActivityAt >= limitMs;
+  }
+
+  private onVisibilityChange(): void {
+    if (this.disposed || !this.lastSnapshot || this.lastSnapshot.locked) {
+      return;
+    }
+    if (
+      this.documentTarget?.visibilityState === "visible" &&
+      this.isIdleDeadlineElapsed(Date.now())
+    ) {
+      void this.handleAutoLockFire();
+    }
   }
 
   private onEngineSnapshot(snapshot: WalletSnapshot): void {
@@ -169,8 +286,20 @@ export class DesktopWalletClient implements WalletClient {
   private onUserActivity(): void {
     if (this.disposed || !this.lastSnapshot || this.lastSnapshot.locked) return;
     const now = Date.now();
+    // Enforce wall-clock deadline if the OS paused timers during sleep/hibernation.
+    if (this.isIdleDeadlineElapsed(now)) {
+      void this.handleAutoLockFire();
+      return;
+    }
     if (now - this.lastActivityAt < ACTIVITY_THROTTLE_MS) return;
     this.lastActivityAt = now;
+    this.autoLockDeferrals = 0;
+    this.armAutoLock();
+  }
+
+  private touchRequestActivity(): void {
+    if (this.disposed || !this.lastSnapshot || this.lastSnapshot.locked) return;
+    this.lastActivityAt = Date.now();
     this.autoLockDeferrals = 0;
     this.armAutoLock();
   }
@@ -195,12 +324,16 @@ export class DesktopWalletClient implements WalletClient {
   private async handleAutoLockFire(): Promise<void> {
     if (this.disposed || !this.lastSnapshot || this.lastSnapshot.locked) return;
     if (this.lastSnapshot.savingState || this.lastSnapshot.persistFailure) {
-      this.armAutoLock(DEFER_RETRY_MS);
+      this.armAutoLock(this.deferRetryMs);
       return;
     }
-    if (this.engine.isSavingOrRelayCritical() && this.autoLockDeferrals < MAX_AUTO_LOCK_DEFERRALS) {
+    if (
+      (this.engine.isSavingOrRelayCritical() ||
+        this.lastSnapshot.pendingTx?.status === "relay-unknown") &&
+      this.autoLockDeferrals < MAX_AUTO_LOCK_DEFERRALS
+    ) {
       this.autoLockDeferrals += 1;
-      this.armAutoLock(DEFER_RETRY_MS);
+      this.armAutoLock(this.deferRetryMs);
       return;
     }
     try {
@@ -208,27 +341,56 @@ export class DesktopWalletClient implements WalletClient {
       this.autoLockDeferrals = 0;
     } catch {
       if (!this.disposed && this.lastSnapshot && !this.lastSnapshot.locked) {
-        this.armAutoLock(DEFER_RETRY_MS);
+        this.armAutoLock(this.deferRetryMs);
       }
     }
   }
 
   private async run<T>(fn: () => Promise<T>, touch = true): Promise<T> {
-    if (touch && this.lastSnapshot && !this.lastSnapshot.locked) {
-      this.lastActivityAt = Date.now();
-      this.armAutoLock();
+    if (touch) {
+      this.touchRequestActivity();
     }
     try {
-      return await fn();
+      const result = await fn();
+      if (touch) {
+        this.touchRequestActivity();
+      }
+      return result;
     } catch (err) {
       throw mapEngineError(err);
+    }
+  }
+
+  dispose(): void {
+    this.disposed = true;
+    this.clearAutoLockTimer();
+    this.listeners.clear();
+    if (this.unsubscribeSystemLock) {
+      this.unsubscribeSystemLock();
+      this.unsubscribeSystemLock = null;
+    }
+    if (this.windowTarget) {
+      for (const evt of ACTIVITY_EVENTS) {
+        this.windowTarget.removeEventListener(evt, this.handleActivityBound);
+      }
+      this.windowTarget.removeEventListener("beforeunload", this.handleBeforeUnloadBound);
+    }
+    if (this.documentTarget) {
+      this.documentTarget.removeEventListener("visibilitychange", this.handleVisibilityChangeBound);
     }
   }
 
   async getSnapshot(): Promise<WalletSnapshot> {
     return this.run(async () => {
       const snap = await this.engine.getSnapshot();
+      const wasUnlocked = this.lastSnapshot !== null && !this.lastSnapshot.locked;
       this.lastSnapshot = snap;
+      if (!snap.locked && (!wasUnlocked || this.autoLockTimer === null)) {
+        if (this.lastActivityAt === 0) {
+          this.lastActivityAt = Date.now();
+        }
+        this.armAutoLock();
+      }
       return snap;
     }, false);
   }
@@ -244,13 +406,14 @@ export class DesktopWalletClient implements WalletClient {
   }
 
   async getPrefs(): Promise<WalletPrefs> {
-    return readDesktopPrefs();
+    return readDesktopPrefs(this.storage);
   }
 
   async updatePrefs(patch: Partial<WalletPrefs>): Promise<WalletPrefs> {
-    const next = writeDesktopPrefs(patch);
+    const next = writeDesktopPrefs(this.storage, patch);
     this.autoLockMinutes = next.autoLockMinutes;
     if (this.lastSnapshot && !this.lastSnapshot.locked) {
+      this.autoLockDeferrals = 0;
       this.armAutoLock();
     }
     return next;
@@ -316,7 +479,12 @@ export class DesktopWalletClient implements WalletClient {
     return this.run(async () => {
       await this.engine.resetVault();
       this.clearAutoLockTimer();
-      writeDesktopPrefs({ activePublicNode: DEFAULT_PUBLIC_NODE_URL, customNodes: [] });
+      this.autoLockDeferrals = 0;
+      writeDesktopPrefs(this.storage, {
+        activePublicNode: DEFAULT_PUBLIC_NODE_URL,
+        customNodes: []
+      });
+      await this.bridge?.authorizeNodeOrigin(DEFAULT_PUBLIC_NODE_URL, "active");
       return await this.engine.setActiveNode(DEFAULT_PUBLIC_NODE_URL);
     }, false);
   }
@@ -330,15 +498,20 @@ export class DesktopWalletClient implements WalletClient {
   }
 
   probeNode(url: string): Promise<NodeProbeResultDto> {
-    return this.run(() => this.engine.probeNode(url));
+    return this.run(async () => {
+      const validated = validateNodeUrl(url);
+      await this.bridge?.authorizeNodeOrigin(validated.url, "probe");
+      return await this.engine.probeNode(validated.url);
+    });
   }
 
   switchNode(url: string, saveAsCustom = false): Promise<WalletSnapshot> {
     return this.run(async () => {
       const validated = validateNodeUrl(url);
+      await this.bridge?.authorizeNodeOrigin(validated.url, "active");
       const snap = await this.engine.setActiveNode(validated.url);
-      const current = readDesktopPrefs();
-      writeDesktopPrefs({
+      const current = readDesktopPrefs(this.storage);
+      writeDesktopPrefs(this.storage, {
         activePublicNode: validated.url,
         customNodes: saveAsCustom ? [...current.customNodes, validated.url] : current.customNodes
       });

@@ -10,18 +10,26 @@ export interface ValidatedNodeUrl {
   readonly isLocal: boolean;
 }
 
-const LOCAL_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]"]);
+// CSP3 host-source and MV3 host_permissions do not accept IPv6 literal brackets ([::1]);
+// users running a local IPv6 daemon can connect via http://localhost:<port>.
+const LOCAL_HOSTS = new Set(["localhost", "127.0.0.1"]);
+const VALID_BASE_PATH_RE = /^(\/[A-Za-z0-9._~-]+)+$/;
+const MAX_BASE_PATH_LENGTH = 256;
 
 /**
  * Strictly validate a Zephyr daemon RPC URL:
  * - Remote hosts MUST use https://
  * - Plain http:// is allowed ONLY for localhost / 127.0.0.1 / [::1]
- * - Rejects embedded credentials, query strings (zephyrd returns 404), and fragments
+ * - Rejects embedded credentials, query strings (zephyrd returns 404), fragments,
+ *   percent-encoding, backslashes, and non-normalized paths to match zephyr-ts
  */
 export function validateNodeUrl(raw: string): ValidatedNodeUrl {
   const trimmed = raw.trim();
   if (!trimmed) {
     throw new Error("Node URL is required");
+  }
+  if (/[%\\]/.test(trimmed)) {
+    throw new Error("Node URL must not contain percent-encoding or backslashes");
   }
 
   let parsed: URL;
@@ -59,6 +67,11 @@ export function validateNodeUrl(raw: string): ValidatedNodeUrl {
   }
 
   const cleanPath = parsed.pathname.replace(/\/+$/, "");
+  if (cleanPath.length > 0) {
+    if (cleanPath.length > MAX_BASE_PATH_LENGTH || !VALID_BASE_PATH_RE.test(cleanPath)) {
+      throw new Error("Node URL path contains invalid or unsupported characters");
+    }
+  }
   const normalizedUrl = `${parsed.origin}${cleanPath}`;
   // Extension match patterns omit ports so Firefox and Chrome permissions.request/contains accept them.
   const originPattern = `${parsed.protocol}//${parsed.hostname}/*`;

@@ -1,16 +1,30 @@
 import fs from "node:fs";
 import path from "node:path";
-import { app, BrowserWindow, ipcMain, protocol, safeStorage, session } from "electron";
+import {
+  app,
+  BrowserWindow,
+  ipcMain,
+  Menu,
+  powerMonitor,
+  protocol,
+  safeStorage,
+  session,
+  type IpcMainInvokeEvent
+} from "electron";
 import { DESKTOP_IPC_CHANNELS } from "../shared/bridge.js";
 import {
   APP_HOST,
   APP_ORIGIN,
   APP_SCHEME,
+  buildStaticFileMap,
+  DEFAULT_DAEMON_ORIGIN,
   DESKTOP_PAGE_CSP,
   DESKTOP_WORKER_CSP,
   isAllowedAppNavigation,
   isAllowedDaemonRequest,
   isWorkerAssetPath,
+  resolveDaemonOrigin,
+  shouldCancelDaemonRedirect,
   withDaemonCorsHeaders
 } from "./security.js";
 
@@ -24,20 +38,40 @@ const MIME_TYPES: Record<string, string> = {
   ".json": "application/json; charset=utf-8"
 };
 
+const PROBE_ORIGIN_TTL_MS = 30_000;
+
 const argv = process.argv.slice(1);
 const OFFLINE_MODE = argv.includes("--offline");
-const userDataArgIdx = argv.findIndex((a) => a === "--user-data-dir");
-const userDataEq = argv.find((a) => a.startsWith("--user-data-dir="));
-const customUserDataDir =
-  userDataEq !== undefined
-    ? userDataEq.slice("--user-data-dir=".length)
-    : userDataArgIdx >= 0
-      ? argv[userDataArgIdx + 1]
-      : undefined;
+const HEADLESS_SMOKE = !app.isPackaged && argv.includes("--headless-smoke");
 
-if (customUserDataDir) {
-  app.setPath("userData", path.resolve(customUserDataDir));
+if (!app.isPackaged) {
+  const userDataArgIdx = argv.findIndex((a) => a === "--user-data-dir");
+  const userDataEq = argv.find((a) => a.startsWith("--user-data-dir="));
+  const customUserDataDir =
+    userDataEq !== undefined
+      ? userDataEq.slice("--user-data-dir=".length)
+      : userDataArgIdx >= 0
+        ? argv[userDataArgIdx + 1]
+        : undefined;
+
+  if (customUserDataDir && !customUserDataDir.startsWith("-")) {
+    app.setPath("userData", path.resolve(customUserDataDir));
+  }
 }
+
+const gotSingleInstanceLock = app.requestSingleInstanceLock();
+if (!gotSingleInstanceLock) {
+  app.quit();
+  process.exit(0);
+}
+
+app.on("second-instance", () => {
+  const existing = BrowserWindow.getAllWindows()[0];
+  if (existing) {
+    if (existing.isMinimized()) existing.restore();
+    existing.focus();
+  }
+});
 
 protocol.registerSchemesAsPrivileged([
   {
@@ -58,22 +92,53 @@ if (argv.includes("--disable-gpu") || OFFLINE_MODE) {
 const RENDERER_ROOT = path.resolve(__dirname, "../renderer");
 const PRELOAD_PATH = path.resolve(__dirname, "../preload/preload.cjs");
 
-function buildStaticFileMap(rootDir: string): Map<string, string> {
-  const map = new Map<string, string>();
-  const walk = (dir: string): void => {
-    if (!fs.existsSync(dir)) return;
-    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-      const full = path.join(dir, entry.name);
-      if (entry.isDirectory()) {
-        walk(full);
-      } else {
-        const rel = "/" + path.relative(rootDir, full).split(path.sep).join("/");
-        map.set(rel, full);
-      }
+let activeDaemonOrigin: string = DEFAULT_DAEMON_ORIGIN;
+let probeDaemonLease: { readonly origin: string; readonly expiresAt: number } | null = null;
+
+function getAuthorizedDaemonOrigins(): ReadonlySet<string> {
+  const origins = new Set<string>([DEFAULT_DAEMON_ORIGIN, activeDaemonOrigin]);
+  if (probeDaemonLease) {
+    if (Date.now() < probeDaemonLease.expiresAt) {
+      origins.add(probeDaemonLease.origin);
+    } else {
+      probeDaemonLease = null;
     }
-  };
-  walk(rootDir);
-  return map;
+  }
+  return origins;
+}
+
+function isAuthorizedIpcSender(event: IpcMainInvokeEvent): boolean {
+  if (!event.senderFrame || event.senderFrame !== event.sender.mainFrame) {
+    return false;
+  }
+  return isAllowedAppNavigation(event.senderFrame.url);
+}
+
+function configureApplicationMenu(): void {
+  if (process.platform === "darwin") {
+    Menu.setApplicationMenu(
+      Menu.buildFromTemplate([
+        {
+          label: app.name,
+          submenu: [{ role: "hide" }, { role: "hideOthers" }, { role: "unhide" }, { role: "quit" }]
+        },
+        {
+          label: "Edit",
+          submenu: [
+            { role: "undo" },
+            { role: "redo" },
+            { type: "separator" },
+            { role: "cut" },
+            { role: "copy" },
+            { role: "paste" },
+            { role: "selectAll" }
+          ]
+        }
+      ])
+    );
+  } else {
+    Menu.setApplicationMenu(null);
+  }
 }
 
 function registerAppProtocol(): void {
@@ -89,24 +154,42 @@ function registerAppProtocol(): void {
     };
 
     if (url.hostname !== APP_HOST || (request.method !== "GET" && request.method !== "HEAD")) {
-      return new Response("Not found", { status: 404, headers: baseHeaders });
+      return new Response("Not found", {
+        status: 404,
+        headers: { ...baseHeaders, "Content-Type": "text/plain; charset=utf-8" }
+      });
     }
 
     const reqPath = url.pathname === "/" ? "/index.html" : url.pathname;
     const resolved = files.get(reqPath);
     if (!resolved) {
-      return new Response("Not found", { status: 404, headers: baseHeaders });
+      return new Response("Not found", {
+        status: 404,
+        headers: { ...baseHeaders, "Content-Type": "text/plain; charset=utf-8" }
+      });
     }
 
     const ext = path.extname(resolved);
-    const data = fs.readFileSync(resolved);
-    return new Response(data, {
-      status: 200,
-      headers: {
-        ...baseHeaders,
-        "Content-Type": MIME_TYPES[ext] ?? "application/octet-stream"
-      }
-    });
+    const contentType = MIME_TYPES[ext] ?? "application/octet-stream";
+    if (request.method === "HEAD") {
+      return new Response(null, {
+        status: 200,
+        headers: { ...baseHeaders, "Content-Type": contentType }
+      });
+    }
+
+    try {
+      const data = await fs.promises.readFile(resolved);
+      return new Response(data, {
+        status: 200,
+        headers: { ...baseHeaders, "Content-Type": contentType }
+      });
+    } catch {
+      return new Response("Internal error", {
+        status: 500,
+        headers: { ...baseHeaders, "Content-Type": "text/plain; charset=utf-8" }
+      });
+    }
   });
 }
 
@@ -118,20 +201,44 @@ function configureSessionGuards(): void {
   });
   ses.setPermissionCheckHandler(() => false);
 
-  ses.webRequest.onBeforeRequest({ urls: ["<all_urls>"] }, (details, callback) => {
-    if (isAllowedDaemonRequest(details.url, details.resourceType, OFFLINE_MODE)) {
+  ses.webRequest.onBeforeRequest((details, callback) => {
+    const allowed = isAllowedDaemonRequest(
+      {
+        url: details.url,
+        resourceType: details.resourceType,
+        method: details.method,
+        ...(details.initiatorOrigin !== undefined ? { initiatorOrigin: details.initiatorOrigin } : {})
+      },
+      getAuthorizedDaemonOrigins(),
+      OFFLINE_MODE
+    );
+    if (allowed) {
       callback({});
       return;
     }
     callback({ cancel: true });
   });
 
-  // Enable direct daemon RPC from the sandboxed app:// renderer without browser CORS failures.
+  // Enable direct daemon RPC strictly for authorized daemon origins and cancel 3xx redirects.
   ses.webRequest.onHeadersReceived(
-    { urls: ["https://*/*", "http://127.0.0.1/*", "http://localhost/*", "http://[::1]/*"] },
+    { urls: ["https://*/*", "http://127.0.0.1/*", "http://localhost/*"] },
     (details, callback) => {
-      if (!isAllowedDaemonRequest(details.url, details.resourceType, OFFLINE_MODE)) {
-        callback({});
+      if (shouldCancelDaemonRedirect(details.url, details.statusCode)) {
+        callback({ cancel: true });
+        return;
+      }
+      const allowed = isAllowedDaemonRequest(
+        {
+          url: details.url,
+          resourceType: details.resourceType,
+          method: details.method,
+          ...(details.initiatorOrigin !== undefined ? { initiatorOrigin: details.initiatorOrigin } : {})
+        },
+        getAuthorizedDaemonOrigins(),
+        OFFLINE_MODE
+      );
+      if (!allowed) {
+        callback({ cancel: true });
         return;
       }
       callback({
@@ -143,8 +250,7 @@ function configureSessionGuards(): void {
 
 function registerIpcHandlers(): void {
   ipcMain.handle(DESKTOP_IPC_CHANNELS.SAFE_STORAGE_AVAILABLE, (event) => {
-    const senderUrl = event.senderFrame?.url ?? "";
-    if (!isAllowedAppNavigation(senderUrl)) {
+    if (!isAuthorizedIpcSender(event)) {
       return false;
     }
     try {
@@ -153,6 +259,41 @@ function registerIpcHandlers(): void {
       return false;
     }
   });
+
+  ipcMain.handle(DESKTOP_IPC_CHANNELS.AUTHORIZE_NODE_ORIGIN, (event, payload: unknown) => {
+    if (!isAuthorizedIpcSender(event)) {
+      return false;
+    }
+    if (!payload || typeof payload !== "object") {
+      return false;
+    }
+    const { url, scope } = payload as { url?: unknown; scope?: unknown };
+    if (typeof url !== "string" || (scope !== "active" && scope !== "probe")) {
+      return false;
+    }
+    const origin = resolveDaemonOrigin(url);
+    if (!origin) {
+      return false;
+    }
+    if (scope === "active") {
+      activeDaemonOrigin = origin;
+    } else {
+      probeDaemonLease = { origin, expiresAt: Date.now() + PROBE_ORIGIN_TTL_MS };
+    }
+    return true;
+  });
+}
+
+function registerPowerMonitorGuards(): void {
+  const notifyLock = (): void => {
+    for (const win of BrowserWindow.getAllWindows()) {
+      if (!win.isDestroyed()) {
+        win.webContents.send(DESKTOP_IPC_CHANNELS.SYSTEM_LOCK_REQUEST);
+      }
+    }
+  };
+  powerMonitor.on("suspend", notifyLock);
+  powerMonitor.on("lock-screen", notifyLock);
 }
 
 function createMainWindow(): BrowserWindow {
@@ -161,7 +302,7 @@ function createMainWindow(): BrowserWindow {
     height: 780,
     minWidth: 420,
     minHeight: 580,
-    show: !argv.includes("--headless-smoke"),
+    show: !HEADLESS_SMOKE,
     title: "Lateo Wallet",
     webPreferences: {
       sandbox: true,
@@ -170,6 +311,9 @@ function createMainWindow(): BrowserWindow {
       webSecurity: true,
       allowRunningInsecureContent: false,
       webviewTag: false,
+      devTools: !app.isPackaged,
+      spellcheck: false,
+      enableWebSQL: false,
       preload: PRELOAD_PATH
     }
   });
@@ -179,6 +323,11 @@ function createMainWindow(): BrowserWindow {
   win.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
   win.webContents.on("will-navigate", (event, targetUrl) => {
     if (!isAllowedAppNavigation(targetUrl)) {
+      event.preventDefault();
+    }
+  });
+  win.webContents.on("will-frame-navigate", (event) => {
+    if (!isAllowedAppNavigation(event.url)) {
       event.preventDefault();
     }
   });
@@ -198,9 +347,11 @@ app.on("window-all-closed", () => {
 });
 
 app.whenReady().then(() => {
+  configureApplicationMenu();
   registerAppProtocol();
   configureSessionGuards();
   registerIpcHandlers();
+  registerPowerMonitorGuards();
   createMainWindow();
 
   app.on("activate", () => {

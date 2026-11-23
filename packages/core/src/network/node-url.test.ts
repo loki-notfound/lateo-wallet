@@ -17,7 +17,7 @@ describe("node URL validation", () => {
     expect(withPath.isLocal).toBe(false);
   });
 
-  it("allows plain HTTP only for localhost and 127.0.0.1", () => {
+  it("allows plain HTTP only for localhost and 127.0.0.1 (rejecting IPv6 literal [::1] for CSP/MV3 parity)", () => {
     const localIp = validateNodeUrl("http://127.0.0.1:17767");
     expect(localIp.isLocal).toBe(true);
     expect(localIp.originPattern).toBe("http://127.0.0.1/*");
@@ -25,14 +25,19 @@ describe("node URL validation", () => {
     const localName = validateNodeUrl("http://localhost:17767/");
     expect(localName.isLocal).toBe(true);
     expect(localName.url).toBe("http://localhost:17767");
+
+    expect(() => validateNodeUrl("http://[::1]:17767")).toThrow(/HTTPS/i);
   });
 
-  it("rejects remote plain HTTP, embedded credentials, query strings, and fragments", () => {
+  it("rejects remote plain HTTP, embedded credentials, query strings, fragments, and invalid paths", () => {
     expect(() => validateNodeUrl("http://node.lateo.dev")).toThrow(/HTTPS/i);
     expect(() => validateNodeUrl("http://192.168.1.50:17767")).toThrow(/HTTPS/i);
     expect(() => validateNodeUrl("https://user:pass@node.lateo.dev")).toThrow(/credentials/i);
     expect(() => validateNodeUrl("https://node.lateo.dev?x=1")).toThrow(/query/i);
     expect(() => validateNodeUrl("https://node.lateo.dev#frag")).toThrow(/fragment/i);
     expect(() => validateNodeUrl("ftp://node.lateo.dev")).toThrow(/https/i);
+    expect(() => validateNodeUrl("https://example.org//rpc")).toThrow(/path/i);
+    expect(() => validateNodeUrl("https://example.org/rpc%20v1")).toThrow(/percent-encoding/i);
+    expect(() => validateNodeUrl("https://example.org/rpc\\admin")).toThrow(/backslash/i);
   });
 });

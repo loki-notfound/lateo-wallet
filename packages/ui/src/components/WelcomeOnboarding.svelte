@@ -257,7 +257,7 @@
 
     <div class="lt-callout lt-callout-danger">
       <p>
-        Only enter your 25-word recovery seed inside your local Lateo Wallet extension.
+        Only enter your 25-word recovery seed inside your local Lateo Wallet app.
       </p>
     </div>
 

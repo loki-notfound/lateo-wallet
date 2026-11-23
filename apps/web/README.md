@@ -20,7 +20,7 @@ The web app MUST be served over `https://` (or `http://localhost` / `http://127.
 
 ### 1. Document Content-Security-Policy (HTML & Static Pages)
 
-Serve the HTML document with the following strict CSP header:
+Serve the HTML document with the following strict CSP header (note that `index.html` also embeds a baseline `<meta http-equiv="Content-Security-Policy">` fallback, while HTTP headers are required for `frame-ancestors 'none'` and dedicated Worker CSP):
 
 ```text
 Content-Security-Policy: default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; worker-src 'self'; style-src 'self'; img-src 'self'; manifest-src 'self'; connect-src 'self' https://node.lateo.dev https: http://127.0.0.1:* http://localhost:*; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'
@@ -51,7 +51,7 @@ Ensure `assets/zephyr-*.wasm` is served with `Content-Type: application/wasm` an
 
 By default on HTTPS origins (e.g. `https://wallet.lateo.dev`), Lateo Wallet targets `${origin}/rpc` so daemon RPC traffic stays same-origin and avoids browser CORS restrictions. Users can also switch to `https://node.lateo.dev` or any custom CORS-enabled HTTPS (or localhost HTTP) node in Settings.
 
-Forward `/rpc/*` to a restricted Zephyr daemon RPC endpoint without HTTP redirects and without chunked request transfer encoding.
+Forward only allowlisted restricted Zephyr daemon RPC paths (`POST`/`GET`) under `/rpc/*` without HTTP redirects, without chunked request transfer encoding, without forwarding client IP or credential headers (`X-Forwarded-For`, `X-Real-IP`, `Cookie`, `Authorization`), and with `Cache-Control: no-store`, `Content-Security-Policy: default-src 'none'; frame-ancestors 'none'`, `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`, and HSTS on every `/rpc/` response.
 
 ### Caddy Example
 
@@ -59,15 +59,36 @@ Forward `/rpc/*` to a restricted Zephyr daemon RPC endpoint without HTTP redirec
 wallet.lateo.dev {
 	root * /srv/lateo-wallet/dist
 
-	# Same-origin restricted RPC reverse proxy
-	handle_path /rpc/* {
-		reverse_proxy https://node.lateo.dev {
-			header_up Host node.lateo.dev
-			transport http {
-				read_timeout 120s
-				write_timeout 120s
+	# Same-origin restricted RPC reverse proxy (allowlisted paths & GET/POST only)
+	handle /rpc/* {
+		header {
+			Content-Security-Policy "default-src 'none'; frame-ancestors 'none'"
+			X-Content-Type-Options "nosniff"
+			Referrer-Policy "no-referrer"
+			Strict-Transport-Security "max-age=63072000; includeSubDomains"
+			Cache-Control "no-store"
+		}
+
+		@rpcBadMethod not method GET POST
+		respond @rpcBadMethod 405
+
+		@rpcAllowed path_regexp rpc ^/rpc/(?:json_rpc|getblocks\.bin|get_o_indexes\.bin|get_?outs\.bin|get_?transactions|sendrawtransaction|get_?height|get_info)$
+		handle @rpcAllowed {
+			uri strip_prefix /rpc
+			reverse_proxy https://node.lateo.dev {
+				header_up Host node.lateo.dev
+				header_up -X-Forwarded-For
+				header_up -X-Real-IP
+				header_up -Cookie
+				header_up -Authorization
+				transport http {
+					read_timeout 120s
+					write_timeout 120s
+				}
 			}
 		}
+
+		respond 404
 	}
 
 	# Dedicated worker CSP (required by Firefox for WASM in workers)
@@ -75,11 +96,16 @@ wallet.lateo.dev {
 	header @worker {
 		Content-Security-Policy "default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; connect-src 'self' https://node.lateo.dev https: http://127.0.0.1:* http://localhost:*"
 		X-Content-Type-Options "nosniff"
+		Referrer-Policy "no-referrer"
+		Strict-Transport-Security "max-age=63072000; includeSubDomains"
 		Cache-Control "public, max-age=31536000, immutable"
 	}
 
 	# Document & static assets CSP
-	@notWorker not path_regexp worker ^/assets/zephyr\.worker-[A-Za-z0-9_-]+\.js$
+	@notWorker {
+		not path /rpc/*
+		not path_regexp worker ^/assets/zephyr\.worker-[A-Za-z0-9_-]+\.js$
+	}
 	header @notWorker {
 		Content-Security-Policy "default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; worker-src 'self'; style-src 'self'; img-src 'self'; manifest-src 'self'; connect-src 'self' https://node.lateo.dev https: http://127.0.0.1:* http://localhost:*; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
 		X-Content-Type-Options "nosniff"
@@ -105,23 +131,47 @@ server {
     root /srv/lateo-wallet/dist;
     index index.html;
 
-    # Same-origin restricted RPC reverse proxy
-    location ^~ /rpc/ {
-        proxy_pass https://node.lateo.dev/;
+    # Same-origin restricted RPC reverse proxy (allowlisted wallet paths & GET/POST only)
+    location ~ ^/rpc/(?:json_rpc|getblocks\.bin|get_o_indexes\.bin|get_?outs\.bin|get_?transactions|sendrawtransaction|get_?height|get_info)$ {
+        limit_except GET POST {
+            deny all;
+        }
+        rewrite ^/rpc/(.*)$ /$1 break;
+        proxy_pass https://node.lateo.dev;
         proxy_ssl_server_name on;
         proxy_set_header Host node.lateo.dev;
+        proxy_set_header X-Forwarded-For "";
+        proxy_set_header X-Real-IP "";
+        proxy_set_header Cookie "";
+        proxy_set_header Authorization "";
         proxy_http_version 1.1;
         proxy_request_buffering on;
         proxy_buffering off;
         proxy_read_timeout 120s;
         proxy_send_timeout 120s;
         client_max_body_size 4m;
+        add_header Content-Security-Policy "default-src 'none'; frame-ancestors 'none'" always;
+        add_header X-Content-Type-Options "nosniff" always;
+        add_header Referrer-Policy "no-referrer" always;
+        add_header Strict-Transport-Security "max-age=63072000; includeSubDomains" always;
+        add_header Cache-Control "no-store" always;
+    }
+
+    location ^~ /rpc/ {
+        add_header Content-Security-Policy "default-src 'none'; frame-ancestors 'none'" always;
+        add_header X-Content-Type-Options "nosniff" always;
+        add_header Referrer-Policy "no-referrer" always;
+        add_header Strict-Transport-Security "max-age=63072000; includeSubDomains" always;
+        add_header Cache-Control "no-store" always;
+        return 404;
     }
 
     # Dedicated worker CSP (required by Firefox for WASM in workers)
     location ~ ^/assets/zephyr\.worker-[A-Za-z0-9_-]+\.js$ {
         add_header Content-Security-Policy "default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; connect-src 'self' https://node.lateo.dev https: http://127.0.0.1:* http://localhost:*" always;
         add_header X-Content-Type-Options "nosniff" always;
+        add_header Referrer-Policy "no-referrer" always;
+        add_header Strict-Transport-Security "max-age=63072000; includeSubDomains" always;
         add_header Cache-Control "public, max-age=31536000, immutable" always;
         try_files $uri =404;
     }
@@ -129,6 +179,8 @@ server {
     location /assets/ {
         add_header Content-Security-Policy "default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; worker-src 'self'; style-src 'self'; img-src 'self'; manifest-src 'self'; connect-src 'self' https://node.lateo.dev https: http://127.0.0.1:* http://localhost:*; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'" always;
         add_header X-Content-Type-Options "nosniff" always;
+        add_header Referrer-Policy "no-referrer" always;
+        add_header Strict-Transport-Security "max-age=63072000; includeSubDomains" always;
         add_header Cache-Control "public, max-age=31536000, immutable" always;
         try_files $uri =404;
     }

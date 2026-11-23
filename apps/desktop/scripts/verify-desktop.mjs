@@ -95,9 +95,16 @@ async function main() {
   const pageErrors = [];
   const cspViolations = [];
 
+  let ignoreExpectedOfflineConsoleError = false;
   const attachMonitors = async (win, label) => {
     win.on("console", (msg) => {
-      if (msg.type() === "error") consoleErrors.push(`[${label}] ${msg.text()}`);
+      if (msg.type() === "error") {
+        const text = msg.text();
+        if (ignoreExpectedOfflineConsoleError && text.includes("ERR_BLOCKED_BY_CLIENT")) {
+          return;
+        }
+        consoleErrors.push(`[${label}] ${text}`);
+      }
     });
     win.on("pageerror", (err) => pageErrors.push(`[${label}] ${err.message}`));
     await win.evaluate(() => {
@@ -130,29 +137,59 @@ async function main() {
   };
 
   try {
-    // Session 1: Launch -> verify preload isolation -> create disposable wallet offline -> quiz -> lock
+    // Session 1: Launch -> attach monitors before mount -> verify preload/menu/offline isolation -> create disposable wallet offline -> quiz -> lock
     const s1 = await launchApp(electronBin, userDataDir);
     let createdAddr = "";
     let bridgeInfo;
     try {
-      await s1.win.waitForSelector('[data-testid="welcome-chooser"]', { timeout: 30_000 });
       await attachMonitors(s1.win, "session-1");
+      await s1.win.waitForSelector('[data-testid="welcome-chooser"]', { timeout: 30_000 });
       await assertGuards(s1.win, "welcome");
 
-      bridgeInfo = await s1.win.evaluate(async () => ({
-        hasRequire: typeof window.require !== "undefined",
-        hasProcess: typeof window.process !== "undefined",
-        bridgeKeys: window.lateoDesktop ? Object.keys(window.lateoDesktop).sort() : [],
-        version: window.lateoDesktop?.version ?? null,
-        platform: window.lateoDesktop?.platform ?? null,
-        safeStorage: window.lateoDesktop ? await window.lateoDesktop.isSafeStorageAvailable() : null
-      }));
+      if (process.platform !== "darwin") {
+        const hasAppMenu = await s1.app.evaluate(({ Menu }) => Menu.getApplicationMenu() !== null);
+        assert(!hasAppMenu, "Desktop: expected Menu.getApplicationMenu() === null on Linux/Windows");
+      }
+
+      ignoreExpectedOfflineConsoleError = true;
+      try {
+        bridgeInfo = await s1.win.evaluate(async () => ({
+          hasRequire: typeof window.require !== "undefined",
+          hasProcess: typeof window.process !== "undefined",
+          bridgeKeys: window.lateoDesktop ? Object.keys(window.lateoDesktop).sort() : [],
+          version: window.lateoDesktop?.version ?? null,
+          platform: window.lateoDesktop?.platform ?? null,
+          safeStorage: window.lateoDesktop ? await window.lateoDesktop.isSafeStorageAvailable() : null,
+          offlineFetchBlocked: await fetch("https://node.lateo.dev/json_rpc").then(
+            () => false,
+            () => true
+          ),
+          popupBlocked: window.open("https://example.com") === null,
+          localStorageKeys: Object.keys(window.localStorage),
+          sessionStorageCount: window.sessionStorage.length
+        }));
+      } finally {
+        ignoreExpectedOfflineConsoleError = false;
+      }
       assert(!bridgeInfo.hasRequire && !bridgeInfo.hasProcess, `Node globals leaked: ${JSON.stringify(bridgeInfo)}`);
       assert(
         JSON.stringify(bridgeInfo.bridgeKeys) ===
-          JSON.stringify(["isSafeStorageAvailable", "platform", "version"]),
+          JSON.stringify([
+            "authorizeNodeOrigin",
+            "isSafeStorageAvailable",
+            "onSystemLockRequest",
+            "platform",
+            "version"
+          ]),
         `Unexpected preload bridge keys: ${JSON.stringify(bridgeInfo.bridgeKeys)}`
       );
+      assert(bridgeInfo.offlineFetchBlocked, "Desktop: --offline mode did not block outbound fetch");
+      assert(bridgeInfo.popupBlocked, "Desktop: window.open was not denied");
+      assert(
+        bridgeInfo.localStorageKeys.every((k) => k === "lateo_desktop_prefs_v1"),
+        `Unexpected localStorage keys: ${JSON.stringify(bridgeInfo.localStorageKeys)}`
+      );
+      assert(bridgeInfo.sessionStorageCount === 0, "Desktop: sessionStorage must remain empty");
 
       await s1.win.click('[data-testid="choose-create-btn"]');
       await s1.win.fill('[data-testid="create-password"]', PW);
@@ -205,8 +242,8 @@ async function main() {
     let electronVersion = "unknown";
     try {
       electronVersion = await s2.app.evaluate(() => process.versions.electron);
-      await s2.win.waitForSelector('[data-testid="unlock-screen"]', { timeout: 30_000 });
       await attachMonitors(s2.win, "session-2");
+      await s2.win.waitForSelector('[data-testid="unlock-screen"]', { timeout: 30_000 });
       await assertGuards(s2.win, "session-2-locked");
 
       await s2.win.fill('[data-testid="unlock-password-input"]', PW);

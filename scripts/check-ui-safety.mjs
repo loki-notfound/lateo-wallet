@@ -13,7 +13,13 @@
 import fs from "node:fs";
 import path from "node:path";
 
-const ROOTS = ["packages/ui/src", "apps/extension/src", "apps/web/src", "apps/desktop/src"];
+const ROOTS = [
+  "packages/core/src",
+  "packages/ui/src",
+  "apps/extension/src",
+  "apps/web/src",
+  "apps/desktop/src"
+];
 const EXTRA_FILES = [
   "apps/extension/popup.html",
   "apps/extension/panel.html",
@@ -22,7 +28,7 @@ const EXTRA_FILES = [
   "apps/web/index.html",
   "apps/desktop/index.html"
 ];
-const EXTENSIONS = new Set([".svelte", ".ts", ".js", ".html"]);
+const EXTENSIONS = new Set([".svelte", ".ts", ".js", ".mjs", ".cjs", ".html"]);
 
 const RULES = [
   {
@@ -33,9 +39,16 @@ const RULES = [
   },
   {
     name: "no-dom-html-sink",
-    files: [".svelte", ".ts", ".js"],
-    pattern: /\b(innerHTML|outerHTML|insertAdjacentHTML|dangerouslySetInnerHTML|document\.write)\b/g,
+    files: [".svelte", ".ts", ".js", ".mjs", ".cjs"],
+    pattern:
+      /\b(innerHTML|outerHTML|insertAdjacentHTML|dangerouslySetInnerHTML|document\.writeln?|createContextualFragment)\b/g,
     message: "Direct HTML injection sinks are forbidden"
+  },
+  {
+    name: "no-dynamic-code-exec",
+    files: [".svelte", ".ts", ".js", ".mjs", ".cjs"],
+    pattern: /\b(?:eval\s*\(|new\s+Function\s*\()/g,
+    message: "Dynamic code execution (eval / new Function) violates strict CSP"
   },
   {
     name: "no-inline-style-tag",
@@ -48,6 +61,12 @@ const RULES = [
     files: [".svelte", ".html"],
     pattern: /\bstyle\s*=/gi,
     message: "Inline style= attributes violate strict style-src 'self' CSP discipline"
+  },
+  {
+    name: "no-dom-style-mutation",
+    files: [".svelte", ".ts", ".js", ".mjs", ".cjs"],
+    pattern: /\bsetAttribute\s*\(\s*["']style["']|\.style\s*\.\s*(?:cssText|[a-zA-Z0-9_]+\s*=)/g,
+    message: "Runtime inline style mutations violate strict style-src 'self' CSP discipline"
   },
   {
     name: "no-svelte-style-directive",

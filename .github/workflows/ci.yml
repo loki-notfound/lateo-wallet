@@ -1,0 +1,70 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  verify:
+    name: Typecheck, Security Audit, Unit Tests & Deterministic Builds
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js 24 LTS
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24"
+
+      - name: Enable Corepack
+        run: corepack enable
+
+      - name: Install dependencies (frozen lockfile)
+        run: corepack pnpm install --frozen-lockfile
+
+      - name: Typecheck all workspaces
+        run: corepack pnpm typecheck
+
+      - name: Static UI safety audit
+        run: corepack pnpm check:ui-safety
+
+      - name: Comprehensive build & supply-chain security audit
+        run: corepack pnpm check:security
+
+      - name: Run unit and integration test suite
+        run: corepack pnpm test
+
+      - name: Verify 2x deterministic extension builds and release packages
+        run: |
+          set -euo pipefail
+          rm -rf apps/extension/dist apps/extension/release
+          corepack pnpm build:extension
+          corepack pnpm package:extension
+          cp apps/extension/release/SHA256SUMS /tmp/lateo-sha256-run1.txt
+
+          rm -rf apps/extension/dist apps/extension/release
+          corepack pnpm build:extension
+          corepack pnpm package:extension
+          cp apps/extension/release/SHA256SUMS /tmp/lateo-sha256-run2.txt
+
+          diff -u /tmp/lateo-sha256-run1.txt /tmp/lateo-sha256-run2.txt
+          (cd apps/extension/release && sha256sum -c SHA256SUMS)
+
+      - name: Build Web PWA production bundle
+        run: corepack pnpm build:web
+
+      - name: Build Desktop Electron production bundle
+        run: corepack pnpm build:desktop

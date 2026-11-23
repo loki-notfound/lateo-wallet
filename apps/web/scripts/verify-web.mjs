@@ -433,7 +433,9 @@ function startWebServer(distDir, mockBarrierDistDir) {
         res.writeHead(upstreamRes.status, {
           "Content-Type": upstreamRes.headers.get("content-type") ?? "application/octet-stream",
           "Content-Length": String(upstreamBuf.byteLength),
+          "Content-Security-Policy": "default-src 'none'; frame-ancestors 'none'",
           "X-Content-Type-Options": "nosniff",
+          "Referrer-Policy": "no-referrer",
           "Cache-Control": "no-store"
         });
         res.end(upstreamBuf);
@@ -444,7 +446,11 @@ function startWebServer(distDir, mockBarrierDistDir) {
       if (mockBarrierDistDir && pathname.startsWith("/__mock-barrier/")) {
         const rel = pathname.slice("/__mock-barrier/".length) || "index.html";
         const resolved = path.resolve(mockBarrierDistDir, rel);
-        if (!resolved.startsWith(mockBarrierDistDir) || !fs.existsSync(resolved) || fs.statSync(resolved).isDirectory()) {
+        if (
+          !(resolved === mockBarrierDistDir || resolved.startsWith(mockBarrierDistDir + path.sep)) ||
+          !fs.existsSync(resolved) ||
+          fs.statSync(resolved).isDirectory()
+        ) {
           res.writeHead(404, { "Content-Security-Policy": DOCUMENT_CSP });
           res.end("Not found");
           return;
@@ -464,7 +470,11 @@ function startWebServer(distDir, mockBarrierDistDir) {
       // 3. Static production PWA assets from apps/web/dist
       const relPath = pathname === "/" ? "index.html" : pathname.replace(/^\/+/, "");
       const resolved = path.resolve(distDir, relPath);
-      if (!resolved.startsWith(distDir) || !fs.existsSync(resolved) || fs.statSync(resolved).isDirectory()) {
+      if (
+        !(resolved === distDir || resolved.startsWith(distDir + path.sep)) ||
+        !fs.existsSync(resolved) ||
+        fs.statSync(resolved).isDirectory()
+      ) {
         console.warn(`[verify-web server] 404 ${req.method} ${pathname}`);
         res.writeHead(404, {
           "Content-Security-Policy": DOCUMENT_CSP,

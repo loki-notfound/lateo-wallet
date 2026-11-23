@@ -49,6 +49,12 @@ const EXPECTED_EXTENSION_CSP =
   "default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; worker-src 'self'; style-src 'self'; img-src 'self'; connect-src 'self' https://node.lateo.dev https: http://127.0.0.1:* http://localhost:*; object-src 'none'; base-uri 'none'; form-action 'none';";
 const EXPECTED_UI_META_CSP =
   "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none';";
+const EXPECTED_DESKTOP_PAGE_CSP =
+  "default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; worker-src 'self'; style-src 'self'; img-src 'self'; connect-src 'self' https://node.lateo.dev https: http://127.0.0.1:* http://localhost:*; object-src 'none'; base-uri 'none'; form-action 'none'";
+const EXPECTED_DESKTOP_WORKER_CSP =
+  "default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; connect-src 'self' https://node.lateo.dev https: http://127.0.0.1:* http://localhost:*";
+const EXPECTED_WEB_META_CSP =
+  "default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; worker-src 'self'; style-src 'self'; img-src 'self'; manifest-src 'self'; connect-src 'self' https://node.lateo.dev https: http://127.0.0.1:* http://localhost:*; object-src 'none'; base-uri 'none'; form-action 'none'";
 
 const FORBIDDEN_MANIFEST_KEYS = [
   "content_scripts",
@@ -112,11 +118,56 @@ function runUiSafetyCheck() {
   }
 }
 
+function newestMtimeMs(paths) {
+  let newest = 0;
+  for (const p of paths) {
+    if (!fs.existsSync(p)) continue;
+    const st = fs.statSync(p);
+    if (st.isDirectory()) {
+      for (const f of walkFiles(p)) {
+        const m = fs.statSync(f).mtimeMs;
+        if (m > newest) newest = m;
+      }
+    } else if (st.mtimeMs > newest) {
+      newest = st.mtimeMs;
+    }
+  }
+  return newest;
+}
+
+function isDistStale(sourcePaths, distEntryPaths) {
+  let oldestDist = Number.POSITIVE_INFINITY;
+  for (const p of distEntryPaths) {
+    if (!fs.existsSync(p)) return true;
+    const m = fs.statSync(p).mtimeMs;
+    if (m < oldestDist) oldestDist = m;
+  }
+  return newestMtimeMs(sourcePaths) > oldestDist;
+}
+
 function ensureBuiltDist() {
+  const noRebuild = process.argv.includes("--no-rebuild");
+  const sharedSources = [
+    path.join(ROOT, "packages", "core", "src"),
+    path.join(ROOT, "packages", "ui", "src")
+  ];
   const chromeManifest = path.join(CHROME_DIST, "manifest.json");
   const firefoxManifest = path.join(FIREFOX_DIST, "manifest.json");
-  if (!fs.existsSync(chromeManifest) || !fs.existsSync(firefoxManifest)) {
-    console.log("Extension build outputs missing; running corepack pnpm build:extension...");
+  const extSources = [
+    ...sharedSources,
+    path.join(ROOT, "apps", "extension", "src"),
+    path.join(ROOT, "apps", "extension", "scripts"),
+    path.join(ROOT, "apps", "extension", "popup.html"),
+    path.join(ROOT, "apps", "extension", "panel.html"),
+    path.join(ROOT, "apps", "extension", "app.html"),
+    path.join(ROOT, "apps", "extension", "offscreen.html")
+  ];
+  if (
+    !fs.existsSync(chromeManifest) ||
+    !fs.existsSync(firefoxManifest) ||
+    (!noRebuild && isDistStale(extSources, [chromeManifest, firefoxManifest]))
+  ) {
+    console.log("Extension build outputs missing or stale; running corepack pnpm build:extension...");
     execFileSync("corepack", ["pnpm", "build:extension"], {
       cwd: ROOT,
       stdio: "inherit"
@@ -124,8 +175,14 @@ function ensureBuiltDist() {
   }
   if (fs.existsSync(path.join(WEB_DIR, "package.json"))) {
     const webIndex = path.join(WEB_DIST, "index.html");
-    if (!fs.existsSync(webIndex)) {
-      console.log("Web PWA build output missing; running corepack pnpm build:web...");
+    const webSources = [
+      ...sharedSources,
+      path.join(WEB_DIR, "src"),
+      path.join(WEB_DIR, "index.html"),
+      path.join(WEB_DIR, "vite.config.ts")
+    ];
+    if (!fs.existsSync(webIndex) || (!noRebuild && isDistStale(webSources, [webIndex]))) {
+      console.log("Web PWA build output missing or stale; running corepack pnpm build:web...");
       execFileSync("corepack", ["pnpm", "build:web"], {
         cwd: ROOT,
         stdio: "inherit"
@@ -134,9 +191,22 @@ function ensureBuiltDist() {
   }
   if (fs.existsSync(path.join(DESKTOP_DIR, "package.json"))) {
     const desktopMain = path.join(DESKTOP_DIST, "main", "main.cjs");
+    const desktopPreload = path.join(DESKTOP_DIST, "preload", "preload.cjs");
     const desktopIndex = path.join(DESKTOP_DIST, "renderer", "index.html");
-    if (!fs.existsSync(desktopMain) || !fs.existsSync(desktopIndex)) {
-      console.log("Desktop build output missing; running corepack pnpm build:desktop...");
+    const desktopSources = [
+      ...sharedSources,
+      path.join(DESKTOP_DIR, "src"),
+      path.join(DESKTOP_DIR, "scripts", "build-electron.mjs"),
+      path.join(DESKTOP_DIR, "index.html"),
+      path.join(DESKTOP_DIR, "vite.config.ts")
+    ];
+    if (
+      !fs.existsSync(desktopMain) ||
+      !fs.existsSync(desktopPreload) ||
+      !fs.existsSync(desktopIndex) ||
+      (!noRebuild && isDistStale(desktopSources, [desktopMain, desktopPreload, desktopIndex]))
+    ) {
+      console.log("Desktop build output missing or stale; running corepack pnpm build:desktop...");
       execFileSync("corepack", ["pnpm", "build:desktop"], {
         cwd: ROOT,
         stdio: "inherit"
@@ -320,12 +390,26 @@ function auditManifest(target, distDir) {
 
 function extractHtmlReferencedAssets(htmlText) {
   const refs = [];
-  const attrRegex = /\b(?:src|href)\s*=\s*["']([^"']+)["']/gi;
+  const attrRegex = /\b(?:src|href)\s*=\s*(?:"([^"]+)"|'([^']+)'|([^\s"'=<>`]+))/gi;
   let match;
   while ((match = attrRegex.exec(htmlText)) !== null) {
-    refs.push(match[1]);
+    refs.push(match[1] ?? match[2] ?? match[3]);
   }
   return refs;
+}
+
+function checkNoInlineSourcemap(target, file) {
+  const ext = path.extname(file);
+  if (ext !== ".js" && ext !== ".cjs" && ext !== ".mjs" && ext !== ".css") {
+    return;
+  }
+  const text = fs.readFileSync(file, "utf8");
+  if (/(?:\/\/|\/\*)[#@]\s*sourceMappingURL\s*=/i.test(text)) {
+    fail(
+      "no-sourcemaps",
+      `${target}: inline or linked sourceMappingURL directive found in ${path.relative(ROOT, file)}`
+    );
+  }
 }
 
 function extractJsImportSpecifiers(code) {
@@ -368,11 +452,13 @@ function auditBundleIsolationAndAssets(target, distDir) {
     return;
   }
 
-  // 1. Verify zero sourcemaps anywhere in dist/<target>
+  // 1. Verify zero sourcemaps (files or inline sourceMappingURL) anywhere in dist/<target>
   for (const file of files) {
     const rel = path.relative(ROOT, file);
     if (file.endsWith(".map")) {
       fail("no-sourcemaps", `${target}: sourcemap file found in build output: ${rel}`);
+    } else {
+      checkNoInlineSourcemap(target, file);
     }
   }
 
@@ -584,11 +670,13 @@ function auditWebDist(distDir) {
     return;
   }
 
-  // 1. Zero sourcemaps
+  // 1. Zero sourcemaps (files or inline sourceMappingURL)
   for (const file of files) {
     const rel = path.relative(ROOT, file);
     if (file.endsWith(".map")) {
       fail("no-sourcemaps", `web: sourcemap file found in build output: ${rel}`);
+    } else {
+      checkNoInlineSourcemap("web", file);
     }
   }
 
@@ -653,7 +741,7 @@ function auditWebDist(distDir) {
     }
   }
 
-  // 4. Built HTML & CSS hygiene: zero <style>, zero inline style=, zero remote URLs
+  // 4. Built HTML & CSS hygiene: zero <style>, zero inline style=, baseline meta CSP, zero remote URLs
   for (const file of files) {
     const rel = path.relative(ROOT, file);
     const ext = path.extname(file);
@@ -664,6 +752,12 @@ function auditWebDist(distDir) {
       }
       if (/\bstyle\s*=/i.test(html)) {
         fail("web-html-csp", `${rel}: inline style= attribute found in built HTML`);
+      }
+      if (!html.includes(EXPECTED_WEB_META_CSP)) {
+        fail("web-html-csp", `${rel}: missing expected baseline meta Content-Security-Policy`);
+      }
+      if (html.includes("'unsafe-inline'") || html.includes("'unsafe-eval'")) {
+        fail("web-html-csp", `${rel}: forbidden unsafe-inline/unsafe-eval directive in HTML`);
       }
       for (const ref of extractHtmlReferencedAssets(html)) {
         if (/^(?:https?:)?\/\//i.test(ref)) {
@@ -687,6 +781,21 @@ function auditWebDist(distDir) {
       }
     }
   }
+
+  // 5. Production reverse-proxy documentation hygiene (apps/web/README.md)
+  const webReadme = path.join(WEB_DIR, "README.md");
+  if (fs.existsSync(webReadme)) {
+    const readmeText = fs.readFileSync(webReadme, "utf8");
+    for (const token of [
+      'Cache-Control "no-store"',
+      'add_header Cache-Control "no-store" always;',
+      'Content-Security-Policy "default-src \'none\'; frame-ancestors \'none\'"'
+    ]) {
+      if (!readmeText.includes(token)) {
+        fail("web-proxy-docs", `apps/web/README.md missing hardened reverse-proxy token: ${token}`);
+      }
+    }
+  }
 }
 
 function auditDesktopDist(distDir) {
@@ -703,6 +812,8 @@ function auditDesktopDist(distDir) {
   for (const file of files) {
     if (file.endsWith(".map")) {
       fail("no-sourcemaps", `desktop: sourcemap file found in build output: ${path.relative(ROOT, file)}`);
+    } else {
+      checkNoInlineSourcemap("desktop", file);
     }
   }
 
@@ -723,11 +834,47 @@ function auditDesktopDist(distDir) {
       "sandbox: true",
       "contextIsolation: true",
       "nodeIntegration: false",
+      "webSecurity: true",
+      "webviewTag: false",
+      "spellcheck: false",
+      "enableWebSQL: false",
       "setWindowOpenHandler",
-      "registerSchemesAsPrivileged"
+      "will-navigate",
+      "will-frame-navigate",
+      "will-attach-webview",
+      "registerSchemesAsPrivileged",
+      "requestSingleInstanceLock",
+      "setApplicationMenu",
+      "setPermissionRequestHandler",
+      "setPermissionCheckHandler",
+      "onBeforeRequest",
+      "onHeadersReceived",
+      EXPECTED_DESKTOP_PAGE_CSP,
+      EXPECTED_DESKTOP_WORKER_CSP
     ]) {
       if (!mainCode.includes(reqToken)) {
         fail("desktop-security", `desktop: dist/main/main.cjs missing expected guard "${reqToken}"`);
+      }
+    }
+    if (mainCode.includes("'unsafe-inline'") || mainCode.includes("'unsafe-eval'")) {
+      fail("desktop-security", "desktop: dist/main/main.cjs must not include unsafe-inline or unsafe-eval");
+    }
+  }
+
+  if (fs.existsSync(preloadPath)) {
+    const preloadCode = fs.readFileSync(preloadPath, "utf8");
+    if (!preloadCode.includes("exposeInMainWorld")) {
+      fail("desktop-preload", "desktop: dist/preload/preload.cjs missing contextBridge.exposeInMainWorld");
+    }
+    for (const forbidden of [
+      "node:fs",
+      "child_process",
+      "node:child_process",
+      "shell.openExternal",
+      "ipcRenderer:"
+    ]) {
+      if (preloadCode.includes(forbidden)) {
+        fail("desktop-preload", `desktop: dist/preload/preload.cjs contains forbidden token "${forbidden}"`);
       }
     }
   }
@@ -749,6 +896,9 @@ function auditDesktopDist(distDir) {
       const html = fs.readFileSync(file, "utf8");
       if (/<style\b/i.test(html)) fail("desktop-html-csp", `${rel}: <style> tag found`);
       if (/\bstyle\s*=/i.test(html)) fail("desktop-html-csp", `${rel}: inline style= found`);
+      if (!html.includes(EXPECTED_DESKTOP_PAGE_CSP)) {
+        fail("desktop-html-csp", `${rel}: missing expected baseline meta Content-Security-Policy`);
+      }
       for (const ref of extractHtmlReferencedAssets(html)) {
         if (/^(?:https?:)?\/\//i.test(ref)) {
           fail("no-remote-assets", `${rel}: remote URL "${ref}" in built HTML`);
@@ -756,8 +906,14 @@ function auditDesktopDist(distDir) {
       }
     } else if (ext === ".css") {
       const css = fs.readFileSync(file, "utf8");
-      const urlRegex = /\burl\s*\(\s*["']?([^"')\s]+)["']?\s*\)/gi;
+      const importRegex = /@import\s+(?:url\s*\(\s*)?["']?([^"')\s]+)["']?\s*\)?/gi;
       let match;
+      while ((match = importRegex.exec(css)) !== null) {
+        if (/^(?:https?:)?\/\//i.test(match[1])) {
+          fail("no-remote-assets", `${rel}: remote @import URL "${match[1]}" in built CSS`);
+        }
+      }
+      const urlRegex = /\burl\s*\(\s*["']?([^"')\s]+)["']?\s*\)/gi;
       while ((match = urlRegex.exec(css)) !== null) {
         if (/^(?:https?:)?\/\//i.test(match[1])) {
           fail("no-remote-assets", `${rel}: remote url("${match[1]}") in built CSS`);

@@ -25,6 +25,7 @@
   }: Props = $props();
 
   let step = $state<"display" | "quiz">("display");
+  let seedMasked = $state(false);
   let quizIndices = $state<readonly number[]>([]);
   let quizAnswers = $state<Record<number, string>>({});
   let quizError = $state<string | null>(null);
@@ -33,6 +34,32 @@
   const words = $derived(splitMnemonicWords(seed));
   const createdDateUtc = $derived(createdAt.slice(0, 10));
   const blankSlots = Array.from({ length: 25 }, (_, i) => i + 1);
+
+  $effect(() => {
+    if (step !== "display") return;
+    const hideSeed = (): void => {
+      seedMasked = true;
+    };
+    const onVisChange = (): void => {
+      if (typeof document !== "undefined" && document.visibilityState !== "visible") {
+        seedMasked = true;
+      }
+    };
+    if (typeof window !== "undefined") {
+      window.addEventListener("blur", hideSeed);
+    }
+    if (typeof document !== "undefined") {
+      document.addEventListener("visibilitychange", onVisChange);
+    }
+    return () => {
+      if (typeof window !== "undefined") {
+        window.removeEventListener("blur", hideSeed);
+      }
+      if (typeof document !== "undefined") {
+        document.removeEventListener("visibilitychange", onVisChange);
+      }
+    };
+  });
 
   function startQuiz(): void {
     const picked = pickSeedQuizIndices(words.length, 3);
@@ -109,14 +136,35 @@
   </div>
 
   {#if step === "display"}
-    <ol class="lt-seed-grid" data-testid="seed-word-grid">
-      {#each words as word, idx (idx)}
-        <li class="lt-seed-item" data-word-index={idx + 1}>
-          <span class="lt-seed-num">{String(idx + 1).padStart(2, "0")}</span>
-          <code class="lt-seed-word"><bdi>{word}</bdi></code>
-        </li>
-      {/each}
-    </ol>
+    {#if seedMasked}
+      <div class="lt-callout lt-callout-warning lt-stack" data-testid="seed-masked-curtain">
+        <p>
+          <strong>Recovery seed hidden</strong> because this window lost focus or moved to the
+          background.
+        </p>
+        <div class="lt-form-actions">
+          <button
+            type="button"
+            class="lt-btn lt-btn-secondary"
+            onclick={() => {
+              seedMasked = false;
+            }}
+            data-testid="unmask-seed-btn"
+          >
+            Reveal 25-word seed
+          </button>
+        </div>
+      </div>
+    {:else}
+      <ol class="lt-seed-grid" data-testid="seed-word-grid">
+        {#each words as word, idx (idx)}
+          <li class="lt-seed-item" data-word-index={idx + 1}>
+            <span class="lt-seed-num">{String(idx + 1).padStart(2, "0")}</span>
+            <code class="lt-seed-word"><bdi>{word}</bdi></code>
+          </li>
+        {/each}
+      </ol>
+    {/if}
 
     <div class="lt-callout lt-callout-info">
       <p>

@@ -28,8 +28,21 @@ function copyStaticWebAssets(): Plugin {
   };
 }
 
+const DEV_PREVIEW_HEADERS = {
+  "Content-Security-Policy":
+    "default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; worker-src 'self'; style-src 'self'; img-src 'self'; manifest-src 'self'; connect-src 'self' https://node.lateo.dev https: http://127.0.0.1:* http://localhost:*; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+  "X-Content-Type-Options": "nosniff",
+  "Referrer-Policy": "no-referrer"
+};
+
 export default defineConfig({
   base: "./",
+  server: {
+    headers: DEV_PREVIEW_HEADERS
+  },
+  preview: {
+    headers: DEV_PREVIEW_HEADERS
+  },
   plugins: [
     svelte({
       emitCss: true,

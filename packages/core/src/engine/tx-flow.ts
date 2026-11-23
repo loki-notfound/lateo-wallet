@@ -78,15 +78,15 @@ export interface TxFlowOptions {
     readonly txHashes: readonly string[];
     readonly nodeHost: string;
     readonly reason: string;
-  }) => void;
+  }) => void | Promise<void>;
   /** Called when a retry after an uncertain attempt is rejected (e.g. DOUBLE_SPEND). */
   readonly onUncertainRejection?: (info: {
     readonly txHashes: readonly string[];
     readonly nodeHost: string;
     readonly reason: string;
-  }) => void;
+  }) => void | Promise<void>;
   /** Called when a relay completes and is confirmed relayed cleanly. */
-  readonly onRelayConfirmed?: () => void;
+  readonly onRelayConfirmed?: () => void | Promise<void>;
   /** Pause/resume background sync while a build is prepared or relaying. */
   readonly onSyncPauseChange?: (paused: boolean) => void;
   /** Returns a reason when a new transaction must not be started (e.g. unsaved relay). */
@@ -883,7 +883,7 @@ export class TxFlowController {
               this.notify();
             }
           });
-        return this.toRelayUnknown(
+        return await this.toRelayUnknown(
           entry,
           "RELAY_TIMEOUT",
           "The node did not answer in time — the transaction may have reached the network",
@@ -891,7 +891,7 @@ export class TxFlowController {
         );
       }
       if (raced.t === "err") {
-        return this.handleRelayFailure(entry, raced.e);
+        return await this.handleRelayFailure(entry, raced.e);
       }
       return await this.handleRelayResult(entry, raced.r);
     } finally {
@@ -904,18 +904,18 @@ export class TxFlowController {
     }
   }
 
-  private toRelayUnknown(
+  private async toRelayUnknown(
     entry: PendingEntry,
     reason: string,
     message: string,
     persisted: boolean
-  ): RelayOutcomeDto {
+  ): Promise<RelayOutcomeDto> {
     entry.status = "relay-unknown";
     entry.lastRelayError = message;
     if (entry.txs.every((t) => t.outcome === null || t.outcome === "notSent")) {
       entry.txs = entry.txs.map((t) => ({ ...t, outcome: t.outcome ?? "unknown" }));
     }
-    this.opts.onRelayUnknown?.({
+    await this.opts.onRelayUnknown?.({
       txHashes: entry.txs.map((t) => t.hash),
       nodeHost: entry.nodeHost,
       reason
@@ -941,7 +941,7 @@ export class TxFlowController {
     return dto;
   }
 
-  private handleRelayFailure(entry: PendingEntry, err: unknown): RelayOutcomeDto {
+  private async handleRelayFailure(entry: PendingEntry, err: unknown): Promise<RelayOutcomeDto> {
     const we = asWalletError(err);
     const code = we?.code ?? "";
     const diag = we?.diagnostic ?? "";
@@ -953,7 +953,7 @@ export class TxFlowController {
       if (this.pending === entry) this.clearPending();
       if (hadEarlierUnknown) {
         const reason = diag || "REJECTED";
-        this.opts.onUncertainRejection?.({ txHashes: hashes, nodeHost, reason });
+        await this.opts.onUncertainRejection?.({ txHashes: hashes, nodeHost, reason });
         return {
           kind: "rejected",
           reason,
@@ -976,7 +976,7 @@ export class TxFlowController {
       const nodeHost = entry.nodeHost;
       if (this.pending === entry) this.clearPending();
       if (wasUnknown) {
-        this.opts.onUncertainRejection?.({
+        await this.opts.onUncertainRejection?.({
           txHashes: hashes,
           nodeHost,
           reason: "RELAY_TOKEN_VOID"
@@ -1003,7 +1003,7 @@ export class TxFlowController {
     let message = "No usable answer from the node — the transaction may have reached the network";
     if (diag === "DAEMON_BUSY") message = "The node was busy — the broadcast status is unknown";
     if (diag === "DAEMON_UNREACHABLE") message = "The node was unreachable — the broadcast status is unknown";
-    return this.toRelayUnknown(entry, diag || code || "RELAY_UNKNOWN", message, false);
+    return await this.toRelayUnknown(entry, diag || code || "RELAY_UNKNOWN", message, false);
   }
 
   private async handleRelayResult(
@@ -1018,7 +1018,7 @@ export class TxFlowController {
     const relayedAt = this.now();
 
     if (accepted.length === 0) {
-      return this.toRelayUnknown(
+      return await this.toRelayUnknown(
         entry,
         "RELAY_UNKNOWN",
         "No transaction was confirmed as accepted — the broadcast status is unknown",
@@ -1039,13 +1039,13 @@ export class TxFlowController {
     if (result.complete) {
       if (this.pending === entry) this.clearPending();
       if (anyNotRelayed) {
-        this.opts.onRelayUnknown?.({
+        await this.opts.onRelayUnknown?.({
           txHashes: accepted,
           nodeHost: node.host,
           reason: "NOT_RELAYED"
         });
       } else {
-        this.opts.onRelayConfirmed?.();
+        await this.opts.onRelayConfirmed?.();
       }
       return persisted
         ? {
@@ -1065,7 +1065,7 @@ export class TxFlowController {
             ...(anyNotRelayed ? { notRelayed: true } : {})
           };
     }
-    return this.toRelayUnknown(
+    return await this.toRelayUnknown(
       entry,
       "PARTIAL_RELAY",
       `${accepted.length} of ${entry.txs.length} transactions were accepted — retry the exact remaining transactions or discard and sync`,

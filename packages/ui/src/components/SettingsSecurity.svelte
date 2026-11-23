@@ -396,7 +396,7 @@
         <div>
           <p class="lt-settings-title">Delete local wallet &amp; reset vault</p>
           <p class="lt-settings-desc">
-            Removes <bdi>{walletName}</bdi> and all encrypted IndexedDB data from this browser.
+            Removes <bdi>{walletName}</bdi> and all encrypted IndexedDB data from this device.
           </p>
         </div>
         <button

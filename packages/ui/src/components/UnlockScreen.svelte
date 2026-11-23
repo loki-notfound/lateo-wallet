@@ -110,7 +110,7 @@
     <form onsubmit={handleReset} class="lt-confirm-box lt-stack" data-testid="unlock-reset-confirm">
       <h3>Delete local encrypted vault</h3>
       <p>
-        This permanently removes the local encrypted vault and cache from this browser. Make sure
+        This permanently removes the local encrypted vault and cache from this device. Make sure
         you have your 25-word recovery seed backed up before continuing.
       </p>
       <div class="lt-field">
