@@ -1,0 +1,19 @@
+{
+  "name": "@lateo-wallet/core",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./assets": "./src/assets/index.ts",
+    "./rpc": "./src/rpc/protocol.ts",
+    "./storage": "./src/storage/types.ts",
+    "./vault": "./src/vault/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@loki-notfound/zephyr-ts": "https://github.com/loki-notfound/myzephyr-ts/releases/download/v2.3.0-sec.2-ts.2/loki-notfound-zephyr-ts-2.3.0-sec.2-ts.2.tgz"
+  }
+}

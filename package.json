@@ -1,0 +1,27 @@
+{
+  "name": "lateo-wallet",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@12.21.0",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "typecheck": "corepack pnpm -r typecheck",
+    "check:ui-safety": "node scripts/check-ui-safety.mjs",
+    "test": "vitest run",
+    "build:extension:chrome": "corepack pnpm --filter @lateo-wallet/extension build:chrome",
+    "build:extension:firefox": "corepack pnpm --filter @lateo-wallet/extension build:firefox",
+    "build:extension": "corepack pnpm build:extension:chrome && corepack pnpm build:extension:firefox",
+    "verify:extension": "node apps/extension/scripts/verify-mv3.mjs"
+  },
+  "devDependencies": {
+    "playwright-core": "^1.52.0",
+    "svelte": "^5.35.0",
+    "svelte-check": "^4.3.1",
+    "tsx": "^4.20.3",
+    "typescript": "^5.8.3",
+    "vitest": "^3.2.4"
+  }
+}

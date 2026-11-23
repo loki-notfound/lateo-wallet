@@ -1,0 +1,5 @@
+@lateo/style 0.2.0 (2026-11-18)
+Copied public files only: css/{tokens,base,forms,components,app,wallet,data}.css,
+js/tokens.{js,d.ts}, assets/icons/sprite.svg, assets/badges/*.svg,
+assets/products/wallet/*, and assets/logo/mark*.svg.
+Mark files under assets/lateo/products/wallet/ and assets/lateo/logo/ are All Rights Reserved (see root LICENSE).

@@ -1,0 +1,15 @@
+node_modules/
+dist/
+coverage/
+test-results/
+playwright-report/
+.DS_Store
+*.log
+*.tsbuildinfo
+*.env
+.env.*
+*.pem
+*.key
+*.keys
+*.wallet
+*.cache

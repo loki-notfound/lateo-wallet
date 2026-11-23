@@ -1,0 +1,24 @@
+{
+  "name": "@lateo-wallet/extension",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "build:chrome": "TARGET=chrome vite build && tsx scripts/build-manifest.ts chrome",
+    "build:firefox": "TARGET=firefox vite build && tsx scripts/build-manifest.ts firefox"
+  },
+  "dependencies": {
+    "@lateo-wallet/core": "workspace:*",
+    "@lateo-wallet/ui": "workspace:*",
+    "svelte": "^5.35.0"
+  },
+  "devDependencies": {
+    "@sveltejs/vite-plugin-svelte": "^6.0.0",
+    "@types/chrome": "^0.0.320",
+    "@types/node": "^22.15.0",
+    "tsx": "^4.20.3",
+    "typescript": "^5.8.3",
+    "vite": "^7.0.0"
+  }
+}

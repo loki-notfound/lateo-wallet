@@ -1,0 +1,56 @@
+@import "./lateo/tokens.css";
+@import "./lateo/base.css";
+@import "./lateo/forms.css";
+@import "./lateo/components.css";
+@import "./lateo/app.css";
+@import "./lateo/wallet.css";
+@import "./lateo/data.css";
+
+/* Extension surface sizing without inline styles */
+.lt-ext-surface-popup {
+  width: 390px;
+  min-height: 540px;
+}
+
+.lt-ext-surface-panel {
+  width: 100%;
+  min-height: 100dvh;
+}
+
+.lt-ext-surface-tab {
+  width: 100%;
+  min-height: 100dvh;
+}
+
+.lt-ext-surface-tab .lt-app-main {
+  max-width: var(--lt-measure);
+  width: 100%;
+  margin-inline: auto;
+}
+
+.lt-diag-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(11rem, 1fr));
+  gap: 0.5rem;
+  margin: 0;
+}
+
+.lt-diag-item {
+  background: var(--lt-surface-subtle);
+  border: 1px solid var(--lt-line);
+  border-radius: var(--lt-radius-sm);
+  padding: 0.5rem 0.65rem;
+}
+
+.lt-diag-item dt {
+  font-size: var(--lt-text-xs);
+  color: var(--lt-muted);
+  margin: 0 0 0.15rem;
+}
+
+.lt-diag-item dd {
+  font-family: var(--lt-font-mono);
+  font-size: var(--lt-text-compact-sm);
+  margin: 0;
+  overflow-wrap: anywhere;
+}
