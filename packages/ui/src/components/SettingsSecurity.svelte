@@ -10,6 +10,7 @@
     type WalletPrefs
   } from "@lateo-wallet/core/storage";
   import { evaluatePasswordStrength, splitMnemonicWords } from "@lateo-wallet/core/vault";
+  import NodeSwitcher from "./NodeSwitcher.svelte";
   import PasswordFields from "./PasswordFields.svelte";
 
   const REVEAL_AUTO_MASK_SECONDS = 60;
@@ -20,12 +21,22 @@
     walletName: string;
     viewOnly: boolean;
     onPrefsUpdated: (next: WalletPrefs) => void;
+    onNodeSwitched: (snapshot: WalletSnapshot) => void;
     onVaultReset: (snapshot: WalletSnapshot) => void;
+    onRequestOriginPermission?: (originPattern: string) => Promise<boolean>;
   }
 
-  let { client, prefs, walletName, viewOnly, onPrefsUpdated, onVaultReset }: Props = $props();
+  let {
+    client,
+    prefs,
+    walletName,
+    viewOnly,
+    onPrefsUpdated,
+    onNodeSwitched,
+    onVaultReset,
+    onRequestOriginPermission
+  }: Props = $props();
 
-  // Password change state
   let currentPw = $state("");
   let newPw = $state("");
   let confirmNewPw = $state("");
@@ -38,7 +49,6 @@
     currentPw.length > 0 && newPwStrength.valid && newPw === confirmNewPw && currentPw !== newPw
   );
 
-  // Danger Zone: Secret Reveal state
   let revealPw = $state("");
   let revealBusy = $state(false);
   let revealError = $state<string | null>(null);
@@ -47,7 +57,6 @@
 
   const revealedWords = $derived(revealed?.seed ? splitMnemonicWords(revealed.seed) : []);
 
-  // Danger Zone: Delete Wallet / Reset Vault state
   let showDeleteConfirm = $state(false);
   let deleteBackupChecked = $state(false);
   let deleteConfirmText = $state("");
@@ -61,7 +70,6 @@
     secondsLeft = 0;
   }
 
-  // Auto-mask revealed secrets after 60s AND immediately on window blur / hidden visibility
   $effect(() => {
     if (!revealed) return;
 
@@ -160,6 +168,15 @@
 </script>
 
 <div class="lt-stack" data-testid="settings-security-panel">
+  <!-- Node Switcher -->
+  <NodeSwitcher
+    {client}
+    {prefs}
+    {onPrefsUpdated}
+    onSwitched={onNodeSwitched}
+    {...(onRequestOriginPermission ? { onRequestOriginPermission } : {})}
+  />
+
   <!-- Session & Appearance Preferences -->
   <section class="lt-panel lt-stack">
     <div class="lt-panel-header">
@@ -279,7 +296,6 @@
   <section class="lt-danger-zone" data-testid="danger-zone">
     <h2 class="lt-panel-title">Danger zone</h2>
 
-    <!-- Reveal Seed / Private Keys -->
     <div class="lt-danger-item lt-stack">
       <div>
         <p class="lt-settings-title">
@@ -369,7 +385,6 @@
       {/if}
     </div>
 
-    <!-- Delete Wallet / Reset Vault -->
     <div class="lt-danger-item lt-stack">
       <div class="lt-address-bar">
         <div>

@@ -13,7 +13,10 @@ export class ExtensionPrefsStore implements PrefsStore {
     return {
       theme: stored?.theme ?? DEFAULT_WALLET_PREFS.theme,
       autoLockMinutes: stored?.autoLockMinutes ?? DEFAULT_WALLET_PREFS.autoLockMinutes,
-      activePublicNode: stored?.activePublicNode ?? DEFAULT_WALLET_PREFS.activePublicNode
+      activePublicNode: stored?.activePublicNode ?? DEFAULT_WALLET_PREFS.activePublicNode,
+      customNodes: Array.isArray(stored?.customNodes)
+        ? stored.customNodes.filter((u): u is string => typeof u === "string")
+        : []
     };
   }
 

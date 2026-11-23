@@ -1,3 +1,4 @@
+import { DEFAULT_PUBLIC_NODE_URL, validateNodeUrl } from "@lateo-wallet/core/node-url";
 import type {
   CreateWalletResultDto,
   EngineEvent,
@@ -31,8 +32,8 @@ function broadcastEvent(event: EngineEvent): void {
 
 /**
  * Maintain an active runtime.Port + periodic runtime ping while the wallet is
- * unlocked or executing a sync/relay->getData persistence sequence so Firefox
- * MV3 does not suspend the Event Page mid-operation.
+ * unlocked or executing sync/checkpoint/relay persistence so Firefox MV3 does
+ * not suspend the Event Page mid-operation.
  */
 function updateKeepAlive(active: boolean): void {
   if (active) {
@@ -74,6 +75,8 @@ function isKeepAliveActive(): boolean {
 
 const host = new ExtensionEngineHost({
   hostKind: "firefox-event-page",
+  checkOriginPermission: (originPattern) =>
+    chrome.permissions.contains({ origins: [originPattern] }).catch(() => false),
   onSnapshot: (snapshot) => {
     walletUnlocked = !snapshot.locked;
     updateKeepAlive(walletUnlocked || host.isBusy());
@@ -131,10 +134,33 @@ async function handleRequest(req: EngineRequest): Promise<EngineResponse> {
     return { id: req.id, ok: true, result: updated };
   }
 
+  if (req.type === "SWITCH_NODE") {
+    const validated = validateNodeUrl(req.url);
+    const prefs = await prefsStore.readPrefs();
+    const customNodes =
+      req.saveAsCustom &&
+      validated.url !== DEFAULT_PUBLIC_NODE_URL &&
+      !prefs.customNodes.includes(validated.url)
+        ? [...prefs.customNodes, validated.url]
+        : prefs.customNodes;
+    await prefsStore.writePrefs({ activePublicNode: validated.url, customNodes });
+  }
+
   const res = await host.handleRequest(req);
   if (!res.ok) return res;
 
-  if (req.type === "CHANGE_VAULT_PASSWORD" || req.type === "REVEAL_SECRETS") {
+  if (
+    req.type === "CHANGE_VAULT_PASSWORD" ||
+    req.type === "REVEAL_SECRETS" ||
+    req.type === "REFRESH_RESERVE" ||
+    req.type === "PROBE_NODE" ||
+    req.type === "LIST_SUBADDRESSES" ||
+    req.type === "CREATE_SUBADDRESS" ||
+    req.type === "SET_SUBADDRESS_LABEL" ||
+    req.type === "GET_HISTORY" ||
+    req.type === "REFRESH_POOL" ||
+    req.type === "EXPORT_TX_PROOF"
+  ) {
     if (walletUnlocked) await resetAutoLockAlarm();
     return res;
   }
@@ -168,7 +194,6 @@ async function handleRequest(req: EngineRequest): Promise<EngineResponse> {
 }
 
 chrome.runtime.onConnect.addListener((port) => {
-  // Defense-in-depth sender validation: only accept ports from this extension
   if (port.sender?.id !== chrome.runtime.id) {
     port.disconnect();
     return;

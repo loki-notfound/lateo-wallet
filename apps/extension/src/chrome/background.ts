@@ -1,3 +1,4 @@
+import { DEFAULT_PUBLIC_NODE_URL, validateNodeUrl } from "@lateo-wallet/core/node-url";
 import type {
   CreateWalletResultDto,
   EngineEvent,
@@ -109,13 +110,35 @@ async function forwardToEngine(req: EngineRequest): Promise<EngineResponse> {
 }
 
 async function buildLockedSnapshot(): Promise<WalletSnapshot> {
-  const meta = await idbStore.readMeta();
+  const [meta, prefs] = await Promise.all([idbStore.readMeta(), prefsStore.readPrefs()]);
+  let nodeUrl = DEFAULT_PUBLIC_NODE_URL;
+  let nodeHost = "node.lateo.dev";
+  try {
+    const validated = validateNodeUrl(prefs.activePublicNode);
+    nodeUrl = validated.url;
+    nodeHost = validated.host;
+  } catch {
+    // Fallback to default public node
+  }
   return {
     hasVault: meta !== undefined,
     locked: true,
     savingState: false,
     activeWallet: null,
     balances: [],
+    sync: {
+      state: "idle",
+      nodeUrl,
+      nodeHost,
+      walletHeight: 0,
+      daemonHeight: 0,
+      percentDone: 0,
+      lastSyncedAt: null,
+      lastCheckpointAt: meta?.updatedAt ?? null,
+      errorMessage: null,
+      permissionOriginRequired: null
+    },
+    reserve: null,
     lastPersistedAt: meta?.updatedAt ?? null,
     hostKind: "chrome-offscreen",
     offscreenActive: false
@@ -194,11 +217,44 @@ async function handleUiRequest(req: EngineRequest): Promise<EngineResponse> {
       return { id: req.id, ok: true, result: emptySnap };
     }
 
+    if (req.type === "SWITCH_NODE") {
+      const validated = validateNodeUrl(req.url);
+      const prefs = await prefsStore.readPrefs();
+      const customNodes =
+        req.saveAsCustom &&
+        validated.url !== DEFAULT_PUBLIC_NODE_URL &&
+        !prefs.customNodes.includes(validated.url)
+          ? [...prefs.customNodes, validated.url]
+          : prefs.customNodes;
+      await prefsStore.writePrefs({ activePublicNode: validated.url, customNodes });
+
+      if (!(await hasOffscreenDocument())) {
+        return { id: req.id, ok: true, result: await buildLockedSnapshot() };
+      }
+      const res = await forwardToEngine(req);
+      if (res.ok) {
+        await resetAutoLockAlarm();
+        const snap = { ...(res.result as WalletSnapshot), offscreenActive: true };
+        broadcastEvent({ type: "SNAPSHOT_UPDATED", snapshot: snap });
+        return { id: req.id, ok: true, result: snap };
+      }
+      return res;
+    }
+
     // Operations that require an unlocked session
     if (
       req.type === "MARK_SEED_BACKUP_VERIFIED" ||
       req.type === "CHANGE_VAULT_PASSWORD" ||
-      req.type === "REVEAL_SECRETS"
+      req.type === "REVEAL_SECRETS" ||
+      req.type === "SYNC_NOW" ||
+      req.type === "REFRESH_RESERVE" ||
+      req.type === "PROBE_NODE" ||
+      req.type === "LIST_SUBADDRESSES" ||
+      req.type === "CREATE_SUBADDRESS" ||
+      req.type === "SET_SUBADDRESS_LABEL" ||
+      req.type === "GET_HISTORY" ||
+      req.type === "REFRESH_POOL" ||
+      req.type === "EXPORT_TX_PROOF"
     ) {
       if (!(await hasOffscreenDocument())) {
         return {
@@ -210,7 +266,7 @@ async function handleUiRequest(req: EngineRequest): Promise<EngineResponse> {
       const res = await forwardToEngine(req);
       if (res.ok) {
         await resetAutoLockAlarm();
-        if (req.type === "MARK_SEED_BACKUP_VERIFIED") {
+        if (req.type === "MARK_SEED_BACKUP_VERIFIED" || req.type === "SYNC_NOW") {
           const snap = { ...(res.result as WalletSnapshot), offscreenActive: true };
           broadcastEvent({ type: "SNAPSHOT_UPDATED", snapshot: snap });
           return { id: req.id, ok: true, result: snap };
@@ -221,9 +277,9 @@ async function handleUiRequest(req: EngineRequest): Promise<EngineResponse> {
 
     // CREATE_WALLET, RESTORE_FROM_SEED, RESTORE_VIEW_ONLY, UNLOCK_WALLET
     const wasUnlocked = walletUnlocked;
+    const prefs = await prefsStore.readPrefs();
     const res = await forwardToEngine(req);
     if (!res.ok) {
-      // Tear down idle Offscreen Document immediately if create/restore/unlock failed
       if (!wasUnlocked) {
         await closeOffscreenDocument();
       }
@@ -232,6 +288,15 @@ async function handleUiRequest(req: EngineRequest): Promise<EngineResponse> {
 
     walletUnlocked = true;
     await resetAutoLockAlarm();
+
+    // Ensure configured custom node from prefs is applied on unlock
+    if (prefs.activePublicNode && prefs.activePublicNode !== DEFAULT_PUBLIC_NODE_URL) {
+      void forwardToEngine({
+        id: `init-node-${Date.now()}`,
+        type: "SWITCH_NODE",
+        url: prefs.activePublicNode
+      }).catch(() => {});
+    }
 
     if (req.type === "CREATE_WALLET") {
       const created = res.result as CreateWalletResultDto;
@@ -259,7 +324,6 @@ async function handleUiRequest(req: EngineRequest): Promise<EngineResponse> {
 }
 
 chrome.runtime.onConnect.addListener((port) => {
-  // Defense-in-depth sender validation: only accept ports from this extension
   if (port.sender?.id !== chrome.runtime.id) {
     port.disconnect();
     return;
@@ -282,6 +346,32 @@ chrome.runtime.onConnect.addListener((port) => {
 
     port.onMessage.addListener((msg: unknown) => {
       if (!msg || typeof msg !== "object") return;
+      if (
+        "type" in msg &&
+        (msg as { type: string }).type === "CHECK_ORIGIN_PERMISSION" &&
+        "id" in msg &&
+        "originPattern" in msg
+      ) {
+        const req = msg as { id: string; originPattern: string };
+        void chrome.permissions
+          .contains({ origins: [req.originPattern] })
+          .then((granted) => {
+            try {
+              port.postMessage({ type: "ORIGIN_PERMISSION_RESULT", id: req.id, granted });
+            } catch {
+              // Offscreen disconnected
+            }
+          })
+          .catch(() => {
+            try {
+              port.postMessage({ type: "ORIGIN_PERMISSION_RESULT", id: req.id, granted: false });
+            } catch {
+              // Offscreen disconnected
+            }
+          });
+        return;
+      }
+
       if ("type" in msg && (msg as EngineEvent).type === "SNAPSHOT_UPDATED") {
         const ev = msg as EngineEvent;
         walletUnlocked = !ev.snapshot.locked;

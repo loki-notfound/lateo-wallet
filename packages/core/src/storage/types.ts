@@ -29,12 +29,14 @@ export interface WalletPrefs {
   readonly theme: ThemePreference;
   readonly autoLockMinutes: number;
   readonly activePublicNode: string;
+  readonly customNodes: readonly string[];
 }
 
 export const DEFAULT_WALLET_PREFS: WalletPrefs = Object.freeze({
   theme: "system",
   autoLockMinutes: 15,
-  activePublicNode: "https://node.lateo.dev"
+  activePublicNode: "https://node.lateo.dev",
+  customNodes: []
 });
 
 export interface PrefsStore {

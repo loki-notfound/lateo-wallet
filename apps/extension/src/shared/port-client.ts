@@ -4,9 +4,14 @@ import type {
   EngineRequestPayload,
   EngineResponse,
   HostDiagnosticsDto,
+  NodeProbeResultDto,
+  ProofKind,
+  ReserveStatusDto,
   RevealedSecretsDto,
+  SubaddressDto,
   WalletClient,
   WalletSnapshot,
+  WalletTxDto,
   ZephyrNetwork
 } from "@lateo-wallet/core/rpc";
 import type { WalletPrefs } from "@lateo-wallet/core/storage";
@@ -165,6 +170,77 @@ export class PortWalletClient implements WalletClient {
 
   resetVault(): Promise<WalletSnapshot> {
     return this.request<WalletSnapshot>({ type: "RESET_VAULT" });
+  }
+
+  syncNow(): Promise<WalletSnapshot> {
+    return this.request<WalletSnapshot>({ type: "SYNC_NOW" });
+  }
+
+  refreshReserve(): Promise<ReserveStatusDto | null> {
+    return this.request<ReserveStatusDto | null>({ type: "REFRESH_RESERVE" });
+  }
+
+  probeNode(url: string): Promise<NodeProbeResultDto> {
+    return this.request<NodeProbeResultDto>({ type: "PROBE_NODE", url });
+  }
+
+  switchNode(url: string, saveAsCustom?: boolean): Promise<WalletSnapshot> {
+    return this.request<WalletSnapshot>({
+      type: "SWITCH_NODE",
+      url,
+      ...(saveAsCustom !== undefined ? { saveAsCustom } : {})
+    });
+  }
+
+  listSubaddresses(): Promise<readonly SubaddressDto[]> {
+    return this.request<readonly SubaddressDto[]>({ type: "LIST_SUBADDRESSES" });
+  }
+
+  createSubaddress(label?: string): Promise<SubaddressDto> {
+    return this.request<SubaddressDto>({
+      type: "CREATE_SUBADDRESS",
+      ...(label !== undefined ? { label } : {})
+    });
+  }
+
+  setSubaddressLabel(index: number, label: string): Promise<readonly SubaddressDto[]> {
+    return this.request<readonly SubaddressDto[]>({
+      type: "SET_SUBADDRESS_LABEL",
+      index,
+      label
+    });
+  }
+
+  getHistory(filter?: {
+    readonly asset?: string;
+    readonly direction?: "incoming" | "outgoing";
+  }): Promise<readonly WalletTxDto[]> {
+    return this.request<readonly WalletTxDto[]>({
+      type: "GET_HISTORY",
+      ...(filter?.asset ? { asset: filter.asset } : {}),
+      ...(filter?.direction ? { direction: filter.direction } : {})
+    });
+  }
+
+  refreshPool(): Promise<{ readonly poolCount: number; readonly txs: readonly WalletTxDto[] }> {
+    return this.request<{ readonly poolCount: number; readonly txs: readonly WalletTxDto[] }>({
+      type: "REFRESH_POOL"
+    });
+  }
+
+  exportTxProof(params: {
+    readonly kind: ProofKind;
+    readonly txHash: string;
+    readonly address?: string;
+    readonly message?: string;
+  }): Promise<string> {
+    return this.request<string>({
+      type: "EXPORT_TX_PROOF",
+      kind: params.kind,
+      txHash: params.txHash,
+      ...(params.address ? { address: params.address } : {}),
+      ...(params.message !== undefined ? { message: params.message } : {})
+    });
   }
 
   subscribe(listener: (snapshot: WalletSnapshot) => void): () => void {

@@ -6,6 +6,10 @@
 @import "./lateo/wallet.css";
 @import "./lateo/data.css";
 
+html {
+  scroll-padding-top: 4.5rem;
+}
+
 /* Extension surface sizing without inline styles */
 .lt-ext-surface-popup {
   width: 400px;
@@ -94,7 +98,7 @@
 .lt-meta-pills {
   display: flex;
   flex-wrap: wrap;
-  gap: 0.5rem;
+  gap: 0.45rem;
   align-items: center;
 }
 
@@ -112,6 +116,146 @@
   font: 0.8125rem/1.5 var(--lt-font-mono);
   overflow-wrap: anywhere;
   word-break: break-all;
+}
+
+.lt-balance-breakdown {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 0.35rem 0.75rem;
+  font-size: var(--lt-text-xs);
+  color: var(--lt-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.lt-sync-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 0.55rem;
+  padding: 0.75rem 0.9rem;
+  background: var(--lt-surface);
+  border: 1px solid var(--lt-line);
+  border-radius: var(--lt-radius-lg);
+}
+
+.lt-sync-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+
+.lt-node-link {
+  background: transparent;
+  color: var(--lt-accent);
+  border: 0;
+  padding: 0.1rem 0.25rem;
+  font: 500 var(--lt-text-compact-sm)/1.3 var(--lt-font-mono);
+  cursor: pointer;
+  text-decoration: underline;
+}
+
+.lt-reserve-prices {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(8.5rem, 1fr));
+  gap: 0.45rem;
+  width: 100%;
+}
+
+.lt-price-cell {
+  background: var(--lt-surface);
+  border: 1px solid var(--lt-line);
+  border-radius: var(--lt-radius-sm);
+  padding: 0.4rem 0.55rem;
+  color: var(--lt-fg);
+}
+
+.lt-price-label {
+  display: block;
+  font-size: var(--lt-text-xs);
+  color: var(--lt-muted);
+}
+
+.lt-price-val {
+  font: 600 var(--lt-text-compact-sm)/1.35 var(--lt-font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+.lt-qr-frame {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: #ffffff;
+  border: 1px solid var(--lt-line-strong);
+  border-radius: var(--lt-radius-md);
+  padding: 0.5rem;
+  width: 184px;
+  height: 184px;
+}
+
+.lt-qr-svg {
+  width: 100%;
+  height: 100%;
+  display: block;
+  shape-rendering: crispEdges;
+}
+
+.lt-receive-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 0.9rem;
+  align-items: start;
+}
+
+@media (min-width: 44rem) {
+  .lt-receive-grid {
+    grid-template-columns: auto minmax(0, 1fr);
+  }
+}
+
+.lt-subaddress-row-active {
+  border-color: var(--lt-accent);
+  background: var(--lt-surface-subtle);
+}
+
+.lt-tx-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.lt-tx-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem 0.75rem;
+  width: 100%;
+  padding: 0.65rem 0.85rem;
+  background: var(--lt-surface);
+  color: var(--lt-fg);
+  border: 1px solid var(--lt-line);
+  border-radius: var(--lt-radius-md);
+  text-align: start;
+  cursor: pointer;
+}
+
+.lt-tx-row:hover {
+  border-color: var(--lt-line-strong);
+  background: var(--lt-surface-subtle);
+}
+
+.lt-filter-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  align-items: center;
+}
+
+.lt-filter-bar .lt-select {
+  width: auto;
+  min-width: 8rem;
 }
 
 .lt-print-only {

@@ -41,6 +41,14 @@ export function mountExtensionSurface(surface: SurfaceMode): void {
       }
     : undefined;
 
+  const onRequestOriginPermission = async (originPattern: string): Promise<boolean> => {
+    try {
+      return await chrome.permissions.request({ origins: [originPattern] });
+    } catch {
+      return false;
+    }
+  };
+
   mount(WalletApp, {
     target,
     props: {
@@ -48,6 +56,7 @@ export function mountExtensionSurface(surface: SurfaceMode): void {
       surface,
       onOpenFullTab,
       onThemeApplied: applyTheme,
+      onRequestOriginPermission,
       ...(onOpenSidePanel ? { onOpenSidePanel } : {})
     }
   });

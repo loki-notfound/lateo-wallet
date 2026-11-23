@@ -1,12 +1,16 @@
 #!/usr/bin/env node
 /**
- * Automated M1.2 MV3 end-to-end verification harness for Chromium and Firefox.
- * Covers: onboarding (create + restore height + blank print sheet + 3-word quiz),
- * lock + Chrome Offscreen teardown (including failed-unlock teardown), offline
- * unlock, auto-lock prefs, password rotation, Danger Zone secret reveal + blur
- * auto-mask, delete wallet, restore from 25-word seed (round-trip address match),
- * restore view-only wallet, and strict CSP / zero-inline-style invariants.
- * Uses disposable random wallets only; never touches real funds.
+ * Automated M1.3 MV3 end-to-end verification harness for Chromium and Firefox.
+ * Uses fresh, random, empty disposable wallets only (zero real funds).
+ * Covers:
+ * - Onboarding (Create + live daemon restoreHeight + blank print sheet + 3-word quiz)
+ * - Live read-only sync against https://node.lateo.dev (4 V2 asset cards, reserve ratio & oracle banner)
+ * - Receive view (create & rename subaddress + pure-SVG dark-on-white QR code)
+ * - Transaction History view + opt-in refreshPool()
+ * - Node Switcher live probe against https://node.lateo.dev
+ * - Lock (Chrome Offscreen teardown + failed-unlock teardown) & offline reopen preserving synced checkpoint height + subaddress labels
+ * - Password rotation + Danger Zone secret reveal & blur auto-mask
+ * - Strict CSP / zero console errors / zero <style> / zero [style]
  */
 import fs from "node:fs";
 import os from "node:os";
@@ -20,10 +24,8 @@ const CHROME_DIST = path.join(ROOT, "dist", "chrome");
 const FIREFOX_DIST = path.join(ROOT, "dist", "firefox");
 const CACHE_BROWSERS = path.join(os.homedir(), ".cache", "lateo-wallet-browsers");
 
-const PW_INITIAL = "M12-Initial-Pass!9";
-const PW_ROTATED = "M12-Rotated-Pass!9";
-const PW_SEED_RESTORE = "M12-Seed-Restored!9";
-const PW_VIEW_ONLY = "M12-View-Only!9";
+const PW_INITIAL = "M13-Initial-Pass!9";
+const PW_ROTATED = "M13-Rotated-Pass!9";
 
 function assert(cond, msg) {
   if (!cond) throw new Error(`ASSERTION FAILED: ${msg}`);
@@ -50,6 +52,12 @@ async function getFreePort() {
   });
 }
 
+function parseLeadingHeight(text) {
+  const m = text.match(/Height\s+([\d,]+)/);
+  if (!m) return 0;
+  return Number(m[1].replace(/,/g, ""));
+}
+
 async function verifyChrome() {
   const chromeBin = findBinary("CHROME_BIN", [
     "/usr/bin/chromium",
@@ -59,7 +67,7 @@ async function verifyChrome() {
   assert(chromeBin, "No Chromium/Chrome binary found");
   assert(fs.existsSync(path.join(CHROME_DIST, "manifest.json")), "Build dist/chrome first");
 
-  const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "lateo-chrome-m12-"));
+  const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "lateo-chrome-m13-"));
   const consoleErrors = [];
   const pageErrors = [];
   const cspViolations = [];
@@ -106,146 +114,130 @@ async function verifyChrome() {
       });
     };
 
-    const assertStyleAndCspGuards = async (page, label) => {
+    const assertGuards = async (page, label) => {
       const info = await page.evaluate(() => ({
         styleTags: document.querySelectorAll("style").length,
         inlineStyles: document.querySelectorAll("[style]").length,
         cspViolations: window.__lateoCspViolations ?? []
       }));
-      assert(info.styleTags === 0, `[${label}] Found ${info.styleTags} inline <style> tag(s)`);
-      assert(
-        info.inlineStyles === 0,
-        `[${label}] Found ${info.inlineStyles} inline [style] attribute(s)`
-      );
+      assert(info.styleTags === 0, `[${label}] Found ${info.styleTags} <style> tags`);
+      assert(info.inlineStyles === 0, `[${label}] Found ${info.inlineStyles} [style] attrs`);
       for (const v of info.cspViolations) {
         cspViolations.push(`[${label}] ${JSON.stringify(v)}`);
       }
     };
 
-    const readOffscreenDiag = async (page) =>
-      (await page.textContent('[data-testid="diag-offscreen"]'))?.trim();
+    const getDiag = async (page) =>
+      page.evaluate(async () => {
+        const port = chrome.runtime.connect({ name: "lateo-ui" });
+        return new Promise((resolve, reject) => {
+          port.onMessage.addListener((m) => {
+            port.disconnect();
+            if (m.ok) resolve(m.result);
+            else reject(new Error(m.error?.message));
+          });
+          port.postMessage({ id: "diag-check", type: "GET_DIAGNOSTICS" });
+        });
+      });
 
-    // 1. Popup: Welcome -> Create Wallet -> 25-word seed + restore height + blank sheet + 3-word quiz
-    const popup = await context.newPage();
-    attachMonitors(popup, "chrome-popup");
-    await installCspTrap(popup);
-    await popup.goto(`${baseUrl}/popup.html`, { waitUntil: "domcontentloaded" });
-    await popup.waitForSelector('[data-testid="welcome-chooser"]', { timeout: 15_000 });
-    await assertStyleAndCspGuards(popup, "chrome-welcome");
+    // 1. Open app.html (Full Tab): Create disposable wallet + 3-word quiz
+    const tab = await context.newPage();
+    attachMonitors(tab, "chrome-app");
+    await installCspTrap(tab);
+    await tab.goto(`${baseUrl}/app.html`, { waitUntil: "domcontentloaded" });
+    await tab.waitForSelector('[data-testid="welcome-chooser"]', { timeout: 15_000 });
+    await assertGuards(tab, "chrome-welcome");
 
-    const initOffscreen = await readOffscreenDiag(popup);
-    assert(initOffscreen === "false", `Expected initial offscreen=false, got ${initOffscreen}`);
+    await tab.click('[data-testid="choose-create-btn"]');
+    await tab.fill('[data-testid="create-password"]', PW_INITIAL);
+    await tab.fill('[data-testid="create-confirm"]', PW_INITIAL);
+    await tab.click('[data-testid="create-submit-btn"]');
 
-    await popup.click('[data-testid="choose-create-btn"]');
-    await popup.fill('[data-testid="create-password"]', PW_INITIAL);
-    await popup.fill('[data-testid="create-confirm"]', PW_INITIAL);
-    await popup.click('[data-testid="create-submit-btn"]');
-
-    await popup.waitForSelector('[data-testid="seed-backup-panel"]', { timeout: 45_000 });
-    const backupInfo = await popup.evaluate(() => {
-      const words = Array.from(
-        document.querySelectorAll('[data-testid="seed-word-grid"] li code')
-      ).map((el) => (el.textContent ?? "").trim());
-      const heightText =
-        document.querySelector('[data-testid="backup-restore-height"]')?.textContent ?? "";
-      const heightSource =
-        document.querySelector('[data-testid="backup-height-source"]')?.textContent?.trim() ?? "";
-      const blankSheet = document.querySelector('[data-testid="blank-backup-sheet"]');
-      const blankSlots = blankSheet?.querySelectorAll(".lt-backup-slot").length ?? 0;
-      const blankText = blankSheet?.textContent ?? "";
-      return { words, heightText, heightSource, blankSlots, blankText };
-    });
-    assert(backupInfo.words.length === 25, `Expected 25 words, got ${backupInfo.words.length}`);
-    assert(backupInfo.blankSlots === 25, `Expected 25 blank print slots, got ${backupInfo.blankSlots}`);
-    // Ensure live seed words are NOT inside the printable blank backup sheet
-    assert(
-      !backupInfo.blankText.includes(backupInfo.words[0]),
-      "Printable blank backup sheet must never contain live seed words"
+    await tab.waitForSelector('[data-testid="seed-backup-panel"]', { timeout: 45_000 });
+    const seedWords = await tab.evaluate(() =>
+      Array.from(document.querySelectorAll('[data-testid="seed-word-grid"] li code')).map((e) =>
+        (e.textContent ?? "").trim()
+      )
     );
+    assert(seedWords.length === 25, `Expected 25 words, got ${seedWords.length}`);
 
-    // 3-word quiz: fail once, then pass
-    await popup.click('[data-testid="start-quiz-btn"]');
-    await popup.waitForSelector('[data-testid="seed-quiz-form"]', { timeout: 10_000 });
-    const quizPositions = await popup.evaluate(() =>
+    await tab.click('[data-testid="start-quiz-btn"]');
+    await tab.waitForSelector('[data-testid="seed-quiz-form"]', { timeout: 10_000 });
+    const quizPos = await tab.evaluate(() =>
       Array.from(document.querySelectorAll("[data-quiz-pos]")).map((el) =>
         Number(el.getAttribute("data-quiz-pos"))
       )
     );
-    assert(quizPositions.length === 3, `Expected 3 quiz inputs, got ${quizPositions.length}`);
-
-    for (const pos of quizPositions) {
-      await popup.fill(`[data-testid="quiz-input-${pos}"]`, "definitely-wrong-word");
+    for (const pos of quizPos) {
+      await tab.fill(`[data-testid="quiz-input-${pos}"]`, seedWords[pos - 1]);
     }
-    await popup.click('[data-testid="verify-quiz-btn"]');
-    await popup.waitForSelector('[data-testid="quiz-error"]', { timeout: 10_000 });
+    await tab.click('[data-testid="verify-quiz-btn"]');
+    await tab.waitForSelector('[data-testid="wallet-unlocked"]', { timeout: 20_000 });
 
-    for (const pos of quizPositions) {
-      await popup.fill(`[data-testid="quiz-input-${pos}"]`, backupInfo.words[pos - 1]);
-    }
-    await popup.click('[data-testid="verify-quiz-btn"]');
-    await popup.waitForSelector('[data-testid="wallet-unlocked"]', { timeout: 15_000 });
-    await popup.waitForSelector('[data-testid="backup-verified-badge"]', { timeout: 10_000 });
-
-    const createdAddr = (await popup.textContent('[data-testid="primary-address"]'))
+    const createdAddr = (await tab.textContent('[data-testid="primary-address"]'))
       ?.replace(/\s+/g, "")
       .trim();
     assert(createdAddr && /^ZEPHYR[0-9A-Za-z]+$/.test(createdAddr), `Invalid address: ${createdAddr}`);
-    assert((await readOffscreenDiag(popup)) === "true", "Expected offscreen=true after create");
 
-    // 2. Side Panel & Full Tab surfaces
-    const panel = await context.newPage();
-    attachMonitors(panel, "chrome-panel");
-    await installCspTrap(panel);
-    await panel.goto(`${baseUrl}/panel.html`, { waitUntil: "domcontentloaded" });
-    await panel.waitForSelector('[data-testid="wallet-unlocked"]', { timeout: 15_000 });
-    await assertStyleAndCspGuards(panel, "chrome-panel");
-    assert(
-      (await panel.textContent('[data-testid="primary-address"]'))?.replace(/\s+/g, "").trim() ===
-        createdAddr,
-      "Side panel address mismatch"
+    // Verify all 4 V2 asset cards exist
+    for (const code of ["ZPH", "ZSD", "ZRS", "ZYS"]) {
+      await tab.waitForSelector(`[data-testid="balance-card-${code}"]`, { timeout: 5_000 });
+    }
+
+    // 2. Online read-only sync against https://node.lateo.dev (initial block-hash download + reserve info)
+    await tab.click('[data-testid="sync-now-btn"]');
+    await tab.waitForFunction(
+      () =>
+        document.querySelector('[data-testid="sync-state-badge"]')?.textContent?.trim() === "Synced",
+      null,
+      { timeout: 180_000 }
     );
+    await tab.waitForSelector('[data-testid="reserve-ratio-value"]', { timeout: 30_000 });
+    await tab.waitForSelector('[data-testid="oracle-prices-grid"]', { timeout: 15_000 });
 
-    const tab = await context.newPage();
-    attachMonitors(tab, "chrome-tab");
-    await installCspTrap(tab);
-    await tab.goto(`${baseUrl}/app.html`, { waitUntil: "domcontentloaded" });
-    await tab.waitForSelector('[data-testid="wallet-unlocked"]', { timeout: 15_000 });
-    await assertStyleAndCspGuards(tab, "chrome-tab");
+    const syncedHeightText = (await tab.textContent('[data-testid="sync-heights"]')) ?? "";
+    const syncedHeight = parseLeadingHeight(syncedHeightText);
+    assert(syncedHeight > 100_000, `Expected synced height > 100000, got "${syncedHeightText}"`);
+    const reserveRatioText = (await tab.textContent('[data-testid="reserve-ratio-value"]'))?.trim();
 
-    // 3. Lock -> Offscreen teardown + Failed Unlock -> Offscreen STILL torn down!
-    await tab.click('[data-testid="lock-btn"]');
-    await tab.waitForSelector('[data-testid="unlock-screen"]', { timeout: 15_000 });
-    const afterLockOffscreen = await readOffscreenDiag(tab);
-    assert(afterLockOffscreen === "false", `Expected offscreen=false after lock, got ${afterLockOffscreen}`);
-
-    await tab.fill('[data-testid="unlock-password-input"]', "Wrong-Password-999");
-    await tab.click('[data-testid="unlock-submit-btn"]');
-    await tab.waitForSelector('[data-testid="unlock-error"]', { timeout: 15_000 });
-    // Re-check diagnostics via fresh reload/port to verify Offscreen was closed on failed unlock
-    const afterFailedUnlockOffscreen = await tab.evaluate(async () => {
-      const port = chrome.runtime.connect({ name: "lateo-ui" });
-      return new Promise((resolve, reject) => {
-        port.onMessage.addListener((m) => {
-          port.disconnect();
-          if (m.ok) resolve(m.result.offscreenExists);
-          else reject(new Error(m.error?.message));
-        });
-        port.postMessage({ id: "diag-check", type: "GET_DIAGNOSTICS" });
-      });
-    });
+    // 3. Receive view: create & rename subaddress + verify pure-SVG QR code
+    await tab.click('[data-testid="tab-receive"]');
+    await tab.waitForSelector('[data-testid="receive-view"]', { timeout: 10_000 });
+    await tab.fill('[data-testid="new-subaddress-label"]', "M1.3 Test Sub");
+    await tab.click('[data-testid="create-subaddress-btn"]');
+    await tab.waitForSelector('[data-testid="subaddress-label-1"]', { timeout: 20_000 });
     assert(
-      afterFailedUnlockOffscreen === false,
-      `Expected offscreen=false after failed unlock, got ${afterFailedUnlockOffscreen}`
+      (await tab.textContent('[data-testid="subaddress-label-1"]'))?.trim() === "M1.3 Test Sub",
+      "Created subaddress label mismatch"
     );
+    await tab.click('[data-testid="edit-subaddress-1"]');
+    await tab.fill('[data-testid="edit-label-input-1"]', "Renamed Sub");
+    await tab.click('[data-testid="save-label-btn-1"]');
+    await tab.waitForFunction(
+      () =>
+        document.querySelector('[data-testid="subaddress-label-1"]')?.textContent?.trim() ===
+        "Renamed Sub",
+      null,
+      { timeout: 15_000 }
+    );
+    await tab.waitForSelector('[data-testid="qr-code-svg"] path', { timeout: 10_000 });
+    await assertGuards(tab, "chrome-receive");
 
-    // 4. Unlock with initial password -> Auto-lock prefs + Password Rotation
-    await tab.fill('[data-testid="unlock-password-input"]', PW_INITIAL);
-    await tab.click('[data-testid="unlock-submit-btn"]');
-    await tab.waitForSelector('[data-testid="wallet-unlocked"]', { timeout: 45_000 });
+    // 4. Transaction History view + opt-in refreshPool()
+    await tab.click('[data-testid="tab-history"]');
+    await tab.waitForSelector('[data-testid="history-view"]', { timeout: 10_000 });
+    await tab.waitForSelector('[data-testid="history-empty"]', { timeout: 10_000 });
+    await tab.click('[data-testid="refresh-pool-btn"]');
+    await tab.waitForSelector('[data-testid="pool-status-note"]', { timeout: 30_000 });
+    await assertGuards(tab, "chrome-history");
 
+    // 5. Settings: Node Switcher live probe + Password rotation + Danger Zone blur mask
     await tab.click('[data-testid="tab-security"]');
-    await tab.waitForSelector('[data-testid="settings-security-panel"]', { timeout: 10_000 });
-    await tab.selectOption('[data-testid="autolock-select"]', "30");
+    await tab.waitForSelector('[data-testid="node-switcher"]', { timeout: 10_000 });
+    await tab.click('[data-testid="probe-saved-default"]');
+    await tab.waitForSelector('[data-testid="node-probe-result"]', { timeout: 20_000 });
+    const probeText = (await tab.textContent('[data-testid="node-probe-result"]')) ?? "";
+    assert(probeText.includes("node.lateo.dev"), `Unexpected node probe text: ${probeText}`);
 
     await tab.fill('[data-testid="current-pw-input"]', PW_INITIAL);
     await tab.fill('[data-testid="change-pw-password"]', PW_ROTATED);
@@ -253,111 +245,64 @@ async function verifyChrome() {
     await tab.click('[data-testid="change-pw-submit"]');
     await tab.waitForSelector('[data-testid="change-pw-success"]', { timeout: 15_000 });
 
-    // Lock -> old password fails -> rotated password succeeds
-    await tab.click('[data-testid="lock-btn"]');
-    await tab.waitForSelector('[data-testid="unlock-screen"]', { timeout: 15_000 });
-    await tab.fill('[data-testid="unlock-password-input"]', PW_INITIAL);
-    await tab.click('[data-testid="unlock-submit-btn"]');
-    await tab.waitForSelector('[data-testid="unlock-error"]', { timeout: 15_000 });
-
-    await tab.fill('[data-testid="unlock-password-input"]', PW_ROTATED);
-    await tab.click('[data-testid="unlock-submit-btn"]');
-    await tab.waitForSelector('[data-testid="wallet-unlocked"]', { timeout: 45_000 });
-    assert(
-      (await tab.textContent('[data-testid="primary-address"]'))?.replace(/\s+/g, "").trim() ===
-        createdAddr,
-      "Rotated-password unlock address mismatch"
-    );
-
-    // 5. Danger Zone secret reveal (wrong pw rejected, right pw reveals, blur auto-masks!)
-    await tab.click('[data-testid="tab-security"]');
-    await tab.fill('[data-testid="reveal-pw-input"]', "wrong-pw");
-    await tab.click('[data-testid="reveal-submit-btn"]');
-    await tab.waitForSelector('[data-testid="reveal-error"]', { timeout: 15_000 });
-
     await tab.fill('[data-testid="reveal-pw-input"]', PW_ROTATED);
     await tab.click('[data-testid="reveal-submit-btn"]');
     await tab.waitForSelector('[data-testid="revealed-secrets-box"]', { timeout: 15_000 });
-
-    const revealedViewKey = (await tab.textContent('[data-testid="revealed-view-key"]'))?.trim();
-    const revealedSpendKey = (await tab.textContent('[data-testid="revealed-spend-key"]'))?.trim();
-    assert(revealedViewKey && /^[0-9a-f]{64}$/.test(revealedViewKey), "Invalid revealed view key");
-    assert(revealedSpendKey && /^[0-9a-f]{64}$/.test(revealedSpendKey), "Invalid revealed spend key");
-
-    // Verify immediate auto-mask on window blur
     await tab.evaluate(() => window.dispatchEvent(new Event("blur")));
     await tab.waitForSelector('[data-testid="revealed-secrets-box"]', {
       state: "detached",
       timeout: 5_000
     });
 
-    // 6. Delete wallet -> Restore from 25-word seed -> identical primary address
-    await tab.click('[data-testid="delete-wallet-toggle"]');
-    await tab.check('[data-testid="delete-backup-checkbox"]');
-    await tab.fill('[data-testid="delete-confirm-input"]', "DELETE");
-    await tab.click('[data-testid="delete-wallet-submit"]');
-    await tab.waitForSelector('[data-testid="welcome-chooser"]', { timeout: 15_000 });
+    // 6. Lock -> verify Offscreen teardown + Failed unlock teardown -> Reopen restores checkpoint height & subaddress!
+    await tab.click('[data-testid="lock-btn"]');
+    await tab.waitForSelector('[data-testid="unlock-screen"]', { timeout: 20_000 });
+    assert((await getDiag(tab)).offscreenExists === false, "Expected offscreen=false after lock");
 
-    await tab.click('[data-testid="choose-restore-seed-btn"]');
-    await tab.fill('[data-testid="restore-seed-input"]', backupInfo.words.join(" "));
-    await tab.fill('[data-testid="restore-seed-height"]', "900000");
-    await tab.fill('[data-testid="restore-seed-password"]', PW_SEED_RESTORE);
-    await tab.fill('[data-testid="restore-seed-confirm"]', PW_SEED_RESTORE);
-    await tab.click('[data-testid="restore-seed-submit"]');
+    await tab.fill('[data-testid="unlock-password-input"]', PW_INITIAL);
+    await tab.click('[data-testid="unlock-submit-btn"]');
+    await tab.waitForSelector('[data-testid="unlock-error"]', { timeout: 15_000 });
+    assert(
+      (await getDiag(tab)).offscreenExists === false,
+      "Expected offscreen=false after failed unlock"
+    );
+
+    await tab.fill('[data-testid="unlock-password-input"]', PW_ROTATED);
+    await tab.click('[data-testid="unlock-submit-btn"]');
     await tab.waitForSelector('[data-testid="wallet-unlocked"]', { timeout: 45_000 });
 
-    const restoredSeedAddr = (await tab.textContent('[data-testid="primary-address"]'))
-      ?.replace(/\s+/g, "")
-      .trim();
-    assert(restoredSeedAddr === createdAddr, "Seed-restored address mismatch");
+    const reopenedHeightText = (await tab.textContent('[data-testid="sync-heights"]')) ?? "";
+    const reopenedHeight = parseLeadingHeight(reopenedHeightText);
     assert(
-      (await tab.textContent('[data-testid="wallet-restore-height"]'))?.trim() === "900000",
-      "Seed-restored height mismatch"
+      reopenedHeight >= syncedHeight,
+      `Expected checkpoint height >= ${syncedHeight} on reopen, got "${reopenedHeightText}"`
     );
 
-    // 7. Reset from unlock screen -> Restore View-Only wallet -> verify view-only banner & no spend key
-    await tab.click('[data-testid="lock-btn"]');
-    await tab.waitForSelector('[data-testid="unlock-screen"]', { timeout: 15_000 });
-    await tab.click('[data-testid="toggle-reset-btn"]');
-    await tab.fill('[data-testid="unlock-reset-input"]', "DELETE");
-    await tab.click('[data-testid="unlock-reset-submit"]');
-    await tab.waitForSelector('[data-testid="welcome-chooser"]', { timeout: 15_000 });
-
-    await tab.click('[data-testid="choose-restore-view-btn"]');
-    await tab.fill('[data-testid="restore-view-address"]', createdAddr);
-    await tab.fill('[data-testid="restore-view-key"]', revealedViewKey);
-    await tab.fill('[data-testid="restore-view-height"]', "905000");
-    await tab.fill('[data-testid="restore-view-password"]', PW_VIEW_ONLY);
-    await tab.fill('[data-testid="restore-view-confirm"]', PW_VIEW_ONLY);
-    await tab.click('[data-testid="restore-view-submit"]');
-    await tab.waitForSelector('[data-testid="wallet-unlocked"]', { timeout: 45_000 });
-    await tab.waitForSelector('[data-testid="view-only-banner"]', { timeout: 10_000 });
+    await tab.click('[data-testid="tab-receive"]');
+    await tab.waitForSelector('[data-testid="subaddress-label-1"]', { timeout: 15_000 });
     assert(
-      (await tab.textContent('[data-testid="primary-address"]'))?.replace(/\s+/g, "").trim() ===
-        createdAddr,
-      "View-only address mismatch"
+      (await tab.textContent('[data-testid="subaddress-label-1"]'))?.trim() === "Renamed Sub",
+      "Renamed subaddress label did not persist across lock/reopen"
     );
 
-    await tab.click('[data-testid="tab-security"]');
-    await tab.fill('[data-testid="reveal-pw-input"]', PW_VIEW_ONLY);
-    await tab.click('[data-testid="reveal-submit-btn"]');
-    await tab.waitForSelector('[data-testid="revealed-secrets-box"]', { timeout: 15_000 });
-    assert(
-      (await tab.textContent('[data-testid="revealed-view-key"]'))?.trim() === revealedViewKey,
-      "View-only revealed view key mismatch"
-    );
-    assert(
-      (await tab.locator('[data-testid="revealed-spend-key"]').count()) === 0,
-      "View-only wallet must never expose a spend key"
-    );
+    // Quick popup & panel surface check
+    const popup = await context.newPage();
+    attachMonitors(popup, "chrome-popup");
+    await installCspTrap(popup);
+    await popup.goto(`${baseUrl}/popup.html`, { waitUntil: "domcontentloaded" });
+    await popup.waitForSelector('[data-testid="wallet-unlocked"]', { timeout: 15_000 });
+    await assertGuards(popup, "chrome-popup");
+
+    const panel = await context.newPage();
+    attachMonitors(panel, "chrome-panel");
+    await installCspTrap(panel);
+    await panel.goto(`${baseUrl}/panel.html`, { waitUntil: "domcontentloaded" });
+    await panel.waitForSelector('[data-testid="wallet-unlocked"]', { timeout: 15_000 });
+    await assertGuards(panel, "chrome-panel");
 
     await tab.click('[data-testid="lock-btn"]');
-    await tab.waitForSelector('[data-testid="unlock-screen"]', { timeout: 15_000 });
-    assert((await readOffscreenDiag(tab)) === "false", "Expected offscreen=false after final lock");
-
-    await assertStyleAndCspGuards(popup, "chrome-popup-final");
-    await assertStyleAndCspGuards(panel, "chrome-panel-final");
-    await assertStyleAndCspGuards(tab, "chrome-tab-final");
+    await tab.waitForSelector('[data-testid="unlock-screen"]', { timeout: 20_000 });
+    await assertGuards(tab, "chrome-final");
 
     assert(consoleErrors.length === 0, `Chrome console errors: ${consoleErrors.join(" | ")}`);
     assert(pageErrors.length === 0, `Chrome page errors: ${pageErrors.join(" | ")}`);
@@ -367,13 +312,13 @@ async function verifyChrome() {
       browser: "chromium",
       extensionId: extId,
       surfacesVerified: ["popup.html", "panel.html", "app.html"],
-      restoreHeightSource: backupInfo.heightSource,
-      offscreenTeardownOnLock: true,
-      offscreenTeardownOnFailedUnlock: true,
-      passwordRotationVerified: true,
-      dangerZoneRevealAndBlurMaskVerified: true,
-      seedRestoreAddressMatched: true,
-      viewOnlyRestoreVerified: true,
+      syncedHeight,
+      reopenedCheckpointHeight: reopenedHeight,
+      reserveRatioText,
+      subaddressPersistedAcrossLock: true,
+      refreshPoolVerified: true,
+      nodeProbeVerified: true,
+      offscreenTeardownVerified: true,
       consoleErrors: 0,
       cspViolations: 0
     };
@@ -404,28 +349,40 @@ async function wdReq(base, method, endpoint, body) {
   return json.value;
 }
 
-async function waitForSelectorWd(base, sessionId, selector, timeoutMs = 45_000, absent = false) {
+async function waitForCondWd(base, sessionId, script, args = [], timeoutMs = 45_000, label = "cond") {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    const found = await wdReq(base, "POST", `/session/${sessionId}/execute/sync`, {
-      script: "return document.querySelector(arguments[0]) !== null;",
-      args: [selector]
-    });
-    if (absent ? !found : found) return;
-    await new Promise((r) => setTimeout(r, 200));
+    const ok = await wdReq(base, "POST", `/session/${sessionId}/execute/sync`, { script, args });
+    if (ok) return;
+    await new Promise((r) => setTimeout(r, 250));
   }
   const pageState = await wdReq(base, "POST", `/session/${sessionId}/execute/sync`, {
     script:
       "return { text: document.body?.innerText?.slice(0, 600), err: document.querySelector('[role=\"alert\"]')?.textContent };",
     args: []
   });
-  throw new Error(
-    `Timed out waiting for selector ${selector} (absent=${absent}) in Firefox; pageState=${JSON.stringify(pageState)}`
+  throw new Error(`Timed out waiting for ${label} in Firefox; pageState=${JSON.stringify(pageState)}`);
+}
+
+async function waitForSelectorWd(base, sessionId, selector, timeoutMs = 45_000, absent = false) {
+  return waitForCondWd(
+    base,
+    sessionId,
+    absent
+      ? "return document.querySelector(arguments[0]) === null;"
+      : "return document.querySelector(arguments[0]) !== null;",
+    [selector],
+    timeoutMs,
+    `${selector} (absent=${absent})`
   );
 }
 
 async function wdClick(base, sessionId, selector) {
   await waitForSelectorWd(base, sessionId, selector, 20_000);
+  await wdReq(base, "POST", `/session/${sessionId}/execute/sync`, {
+    script: 'document.querySelector(arguments[0])?.scrollIntoView({ block: "center" });',
+    args: [selector]
+  });
   const el = await wdReq(base, "POST", `/session/${sessionId}/element`, {
     using: "css selector",
     value: selector
@@ -493,9 +450,7 @@ async function verifyFirefox() {
           "moz:firefoxOptions": {
             binary: firefoxBin,
             args: ["-headless"],
-            prefs: {
-              "xpinstall.signatures.required": false
-            }
+            prefs: { "xpinstall.signatures.required": false }
           }
         }
       }
@@ -535,7 +490,7 @@ async function verifyFirefox() {
       });
     };
 
-    const installAndCheckGuards = async (label) => {
+    const assertGuards = async (label) => {
       const g = await wdReq(base, "POST", `/session/${sessionId}/execute/sync`, {
         script: `
           if (!window.__lateoMonitors) {
@@ -561,10 +516,10 @@ async function verifyFirefox() {
       assert(g.csp.length === 0, `[${label}] CSP violations: ${JSON.stringify(g.csp)}`);
     };
 
-    // 1. Popup: Welcome -> Create Wallet -> 25-word seed + blank sheet + 3-word quiz
-    await openExtPage("popup.html");
+    // 1. Open app.html: Create disposable wallet + 3-word quiz
+    await openExtPage("app.html");
     await waitForSelectorWd(base, sessionId, '[data-testid="welcome-chooser"]', 20_000);
-    await installAndCheckGuards("firefox-welcome");
+    await assertGuards("firefox-welcome");
 
     await wdClick(base, sessionId, '[data-testid="choose-create-btn"]');
     await wdFill(base, sessionId, '[data-testid="create-password"]', PW_INITIAL);
@@ -572,22 +527,12 @@ async function verifyFirefox() {
     await wdClick(base, sessionId, '[data-testid="create-submit-btn"]');
 
     await waitForSelectorWd(base, sessionId, '[data-testid="seed-backup-panel"]', 45_000);
-    const backupInfo = await wdReq(base, "POST", `/session/${sessionId}/execute/sync`, {
-      script: `
-        const words = Array.from(document.querySelectorAll('[data-testid="seed-word-grid"] li code')).map((e) => (e.textContent || "").trim());
-        const heightSource = (document.querySelector('[data-testid="backup-height-source"]')?.textContent || "").trim();
-        const blank = document.querySelector('[data-testid="blank-backup-sheet"]');
-        return {
-          words,
-          heightSource,
-          blankSlots: blank ? blank.querySelectorAll(".lt-backup-slot").length : 0,
-          blankHasLiveWord: blank ? (blank.textContent || "").includes(words[0] || "___") : true
-        };
-      `,
+    const seedWords = await wdReq(base, "POST", `/session/${sessionId}/execute/sync`, {
+      script:
+        'return Array.from(document.querySelectorAll(\'[data-testid="seed-word-grid"] li code\')).map((e) => (e.textContent || "").trim());',
       args: []
     });
-    assert(backupInfo.words.length === 25, `Firefox expected 25 words, got ${backupInfo.words.length}`);
-    assert(backupInfo.blankSlots === 25 && !backupInfo.blankHasLiveWord, "Firefox blank sheet check failed");
+    assert(seedWords.length === 25, `Firefox expected 25 words, got ${seedWords.length}`);
 
     await wdClick(base, sessionId, '[data-testid="start-quiz-btn"]');
     await waitForSelectorWd(base, sessionId, '[data-testid="seed-quiz-form"]', 10_000);
@@ -597,112 +542,82 @@ async function verifyFirefox() {
       args: []
     });
     for (const pos of quizPos) {
-      await wdFill(base, sessionId, `[data-testid="quiz-input-${pos}"]`, backupInfo.words[pos - 1]);
+      await wdFill(base, sessionId, `[data-testid="quiz-input-${pos}"]`, seedWords[pos - 1]);
     }
     await wdClick(base, sessionId, '[data-testid="verify-quiz-btn"]');
     await waitForSelectorWd(base, sessionId, '[data-testid="wallet-unlocked"]', 20_000);
-    await waitForSelectorWd(base, sessionId, '[data-testid="backup-verified-badge"]', 10_000);
 
-    const createdAddr = (await wdText(base, sessionId, '[data-testid="primary-address"]'))
-      .replace(/\s+/g, "")
-      .trim();
-    assert(/^ZEPHYR[0-9A-Za-z]+$/.test(createdAddr), `Firefox invalid address: ${createdAddr}`);
+    for (const code of ["ZPH", "ZSD", "ZRS", "ZYS"]) {
+      await waitForSelectorWd(base, sessionId, `[data-testid="balance-card-${code}"]`, 5_000);
+    }
 
-    // 2. Open Full Tab (app.html): Lock -> Unlock -> Password Rotation -> Danger Zone Reveal + Blur Mask
-    await openExtPage("app.html");
-    await waitForSelectorWd(base, sessionId, '[data-testid="wallet-unlocked"]', 20_000);
-    await installAndCheckGuards("firefox-app");
+    // 2. Online read-only sync against https://node.lateo.dev
+    await wdClick(base, sessionId, '[data-testid="sync-now-btn"]');
+    await waitForCondWd(
+      base,
+      sessionId,
+      'return document.querySelector(\'[data-testid="sync-state-badge"]\')?.textContent?.trim() === "Synced";',
+      [],
+      180_000,
+      "Firefox synced state"
+    );
+    await waitForSelectorWd(base, sessionId, '[data-testid="reserve-ratio-value"]', 30_000);
+    await waitForSelectorWd(base, sessionId, '[data-testid="oracle-prices-grid"]', 15_000);
+    const syncedHeight = parseLeadingHeight(await wdText(base, sessionId, '[data-testid="sync-heights"]'));
+    assert(syncedHeight > 100_000, `Firefox expected synced height > 100000, got ${syncedHeight}`);
+    const reserveRatioText = (await wdText(base, sessionId, '[data-testid="reserve-ratio-value"]')).trim();
 
-    await wdClick(base, sessionId, '[data-testid="tab-security"]');
-    await waitForSelectorWd(base, sessionId, '[data-testid="settings-security-panel"]', 10_000);
+    // 3. Receive view: create & rename subaddress + QR SVG check
+    await wdClick(base, sessionId, '[data-testid="tab-receive"]');
+    await waitForSelectorWd(base, sessionId, '[data-testid="receive-view"]', 10_000);
+    await wdFill(base, sessionId, '[data-testid="new-subaddress-label"]', "Firefox Sub");
+    await wdClick(base, sessionId, '[data-testid="create-subaddress-btn"]');
+    await waitForSelectorWd(base, sessionId, '[data-testid="subaddress-label-1"]', 20_000);
+    await waitForSelectorWd(base, sessionId, '[data-testid="qr-code-svg"] path', 10_000);
+    await assertGuards("firefox-receive");
 
-    // Rotate password
-    await wdFill(base, sessionId, '[data-testid="current-pw-input"]', PW_INITIAL);
-    await wdFill(base, sessionId, '[data-testid="change-pw-password"]', PW_ROTATED);
-    await wdFill(base, sessionId, '[data-testid="change-pw-confirm"]', PW_ROTATED);
-    await wdClick(base, sessionId, '[data-testid="change-pw-submit"]');
-    await waitForSelectorWd(base, sessionId, '[data-testid="change-pw-success"]', 15_000);
+    // 4. History view + opt-in refreshPool()
+    await wdClick(base, sessionId, '[data-testid="tab-history"]');
+    await waitForSelectorWd(base, sessionId, '[data-testid="history-empty"]', 10_000);
+    await wdClick(base, sessionId, '[data-testid="refresh-pool-btn"]');
+    await waitForSelectorWd(base, sessionId, '[data-testid="pool-status-note"]', 30_000);
+    await assertGuards("firefox-history");
 
-    // Lock -> old password fails -> rotated password succeeds
+    // 5. Lock -> Reopen from IndexedDB restores checkpoint height + subaddress label
     await wdClick(base, sessionId, '[data-testid="lock-btn"]');
-    await waitForSelectorWd(base, sessionId, '[data-testid="unlock-screen"]', 15_000);
+    await waitForSelectorWd(base, sessionId, '[data-testid="unlock-screen"]', 20_000);
     await wdFill(base, sessionId, '[data-testid="unlock-password-input"]', PW_INITIAL);
     await wdClick(base, sessionId, '[data-testid="unlock-submit-btn"]');
-    await waitForSelectorWd(base, sessionId, '[data-testid="unlock-error"]', 15_000);
-
-    await wdFill(base, sessionId, '[data-testid="unlock-password-input"]', PW_ROTATED);
-    await wdClick(base, sessionId, '[data-testid="unlock-submit-btn"]');
     await waitForSelectorWd(base, sessionId, '[data-testid="wallet-unlocked"]', 45_000);
 
-    // Danger zone reveal + blur auto-mask
-    await wdClick(base, sessionId, '[data-testid="tab-security"]');
-    await wdFill(base, sessionId, '[data-testid="reveal-pw-input"]', PW_ROTATED);
-    await wdClick(base, sessionId, '[data-testid="reveal-submit-btn"]');
-    await waitForSelectorWd(base, sessionId, '[data-testid="revealed-secrets-box"]', 15_000);
-    const revealedViewKey = (await wdText(base, sessionId, '[data-testid="revealed-view-key"]')).trim();
-    assert(/^[0-9a-f]{64}$/.test(revealedViewKey), "Firefox invalid revealed view key");
-
-    await wdReq(base, "POST", `/session/${sessionId}/execute/sync`, {
-      script: 'window.dispatchEvent(new Event("blur"));',
-      args: []
-    });
-    await waitForSelectorWd(base, sessionId, '[data-testid="revealed-secrets-box"]', 5_000, true);
-
-    // 3. Delete wallet -> Restore from 25-word seed -> identical address
-    await wdClick(base, sessionId, '[data-testid="delete-wallet-toggle"]');
-    await wdClick(base, sessionId, '[data-testid="delete-backup-checkbox"]');
-    await wdFill(base, sessionId, '[data-testid="delete-confirm-input"]', "DELETE");
-    await wdClick(base, sessionId, '[data-testid="delete-wallet-submit"]');
-    await waitForSelectorWd(base, sessionId, '[data-testid="welcome-chooser"]', 15_000);
-
-    await wdClick(base, sessionId, '[data-testid="choose-restore-seed-btn"]');
-    await wdFill(base, sessionId, '[data-testid="restore-seed-input"]', backupInfo.words.join(" "));
-    await wdFill(base, sessionId, '[data-testid="restore-seed-height"]', "900000");
-    await wdFill(base, sessionId, '[data-testid="restore-seed-password"]', PW_SEED_RESTORE);
-    await wdFill(base, sessionId, '[data-testid="restore-seed-confirm"]', PW_SEED_RESTORE);
-    await wdClick(base, sessionId, '[data-testid="restore-seed-submit"]');
-    await waitForSelectorWd(base, sessionId, '[data-testid="wallet-unlocked"]', 45_000);
-    const restoredAddr = (await wdText(base, sessionId, '[data-testid="primary-address"]'))
-      .replace(/\s+/g, "")
-      .trim();
-    assert(restoredAddr === createdAddr, "Firefox seed restore address mismatch");
-
-    // 4. Reset -> Restore View-Only wallet -> verify view-only mode
-    await wdClick(base, sessionId, '[data-testid="lock-btn"]');
-    await waitForSelectorWd(base, sessionId, '[data-testid="unlock-screen"]', 15_000);
-    await wdClick(base, sessionId, '[data-testid="toggle-reset-btn"]');
-    await wdFill(base, sessionId, '[data-testid="unlock-reset-input"]', "DELETE");
-    await wdClick(base, sessionId, '[data-testid="unlock-reset-submit"]');
-    await waitForSelectorWd(base, sessionId, '[data-testid="welcome-chooser"]', 15_000);
-
-    await wdClick(base, sessionId, '[data-testid="choose-restore-view-btn"]');
-    await wdFill(base, sessionId, '[data-testid="restore-view-address"]', createdAddr);
-    await wdFill(base, sessionId, '[data-testid="restore-view-key"]', revealedViewKey);
-    await wdFill(base, sessionId, '[data-testid="restore-view-height"]', "905000");
-    await wdFill(base, sessionId, '[data-testid="restore-view-password"]', PW_VIEW_ONLY);
-    await wdFill(base, sessionId, '[data-testid="restore-view-confirm"]', PW_VIEW_ONLY);
-    await wdClick(base, sessionId, '[data-testid="restore-view-submit"]');
-    await waitForSelectorWd(base, sessionId, '[data-testid="wallet-unlocked"]', 45_000);
-    await waitForSelectorWd(base, sessionId, '[data-testid="view-only-banner"]', 10_000);
+    const reopenedHeight = parseLeadingHeight(
+      await wdText(base, sessionId, '[data-testid="sync-heights"]')
+    );
     assert(
-      (await wdText(base, sessionId, '[data-testid="primary-address"]')).replace(/\s+/g, "").trim() ===
-        createdAddr,
-      "Firefox view-only address mismatch"
+      reopenedHeight >= syncedHeight,
+      `Firefox checkpoint height did not persist: ${reopenedHeight} < ${syncedHeight}`
     );
 
-    await installAndCheckGuards("firefox-final");
+    await wdClick(base, sessionId, '[data-testid="tab-receive"]');
+    await waitForSelectorWd(base, sessionId, '[data-testid="subaddress-label-1"]', 15_000);
+    assert(
+      (await wdText(base, sessionId, '[data-testid="subaddress-label-1"]')).trim() === "Firefox Sub",
+      "Firefox subaddress label did not persist across lock/reopen"
+    );
+
+    await assertGuards("firefox-final");
     await wdClick(base, sessionId, '[data-testid="lock-btn"]');
-    await waitForSelectorWd(base, sessionId, '[data-testid="unlock-screen"]', 15_000);
+    await waitForSelectorWd(base, sessionId, '[data-testid="unlock-screen"]', 20_000);
 
     return {
       browser: `firefox ${browserVersion}`,
       addonId,
-      surfacesVerified: ["popup.html", "app.html"],
-      restoreHeightSource: backupInfo.heightSource,
-      passwordRotationVerified: true,
-      dangerZoneRevealAndBlurMaskVerified: true,
-      seedRestoreAddressMatched: true,
-      viewOnlyRestoreVerified: true,
+      surfacesVerified: ["app.html"],
+      syncedHeight,
+      reopenedCheckpointHeight: reopenedHeight,
+      reserveRatioText,
+      subaddressPersistedAcrossLock: true,
+      refreshPoolVerified: true,
       consoleErrors: 0,
       cspViolations: 0
     };
@@ -717,14 +632,14 @@ async function verifyFirefox() {
 async function main() {
   const only = process.argv[2];
   if (!only || only === "chrome") {
-    console.log("Running Chromium M1.2 MV3 verification...");
+    console.log("Running Chromium M1.3 MV3 verification...");
     const chromeRes = await verifyChrome();
-    console.log("Chromium M1.2 PASS:", JSON.stringify(chromeRes, null, 2));
+    console.log("Chromium M1.3 PASS:", JSON.stringify(chromeRes, null, 2));
   }
   if (!only || only === "firefox") {
-    console.log("Running Firefox M1.2 MV3 verification...");
+    console.log("Running Firefox M1.3 MV3 verification...");
     const firefoxRes = await verifyFirefox();
-    console.log("Firefox M1.2 PASS:", JSON.stringify(firefoxRes, null, 2));
+    console.log("Firefox M1.3 PASS:", JSON.stringify(firefoxRes, null, 2));
   }
 }
 

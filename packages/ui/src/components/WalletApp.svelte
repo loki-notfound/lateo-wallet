@@ -10,8 +10,12 @@
   import type { SurfaceMode } from "../types.js";
   import AddressChunks from "./AddressChunks.svelte";
   import AssetBadge from "./AssetBadge.svelte";
+  import HistoryView from "./HistoryView.svelte";
+  import ReceiveView from "./ReceiveView.svelte";
+  import ReserveBanner from "./ReserveBanner.svelte";
   import SeedBackupFlow from "./SeedBackupFlow.svelte";
   import SettingsSecurity from "./SettingsSecurity.svelte";
+  import SyncStatusBar from "./SyncStatusBar.svelte";
   import UnlockScreen from "./UnlockScreen.svelte";
   import WelcomeOnboarding from "./WelcomeOnboarding.svelte";
 
@@ -21,16 +25,27 @@
     onOpenFullTab?: () => void;
     onOpenSidePanel?: () => void;
     onThemeApplied?: (theme: WalletPrefs["theme"]) => void;
+    onRequestOriginPermission?: (originPattern: string) => Promise<boolean>;
   }
 
-  let { client, surface, onOpenFullTab, onOpenSidePanel, onThemeApplied }: Props = $props();
+  let {
+    client,
+    surface,
+    onOpenFullTab,
+    onOpenSidePanel,
+    onThemeApplied,
+    onRequestOriginPermission
+  }: Props = $props();
+
+  type WalletTab = "overview" | "receive" | "history" | "security";
 
   let snapshot = $state<WalletSnapshot | null>(null);
   let diagnostics = $state<HostDiagnosticsDto | null>(null);
   let prefs = $state<WalletPrefs>(DEFAULT_WALLET_PREFS);
   let pendingBackup = $state<CreateWalletResultDto | null>(null);
-  let activeTab = $state<"overview" | "security">("overview");
+  let activeTab = $state<WalletTab>("overview");
   let busy = $state(false);
+  let reserveBusy = $state(false);
   let errorMsg = $state<string | null>(null);
 
   const surfaceClass = $derived(`lt-app-shell lt-ext-surface-${surface}`);
@@ -84,6 +99,40 @@
       errorMsg = err instanceof Error ? err.message : "Lock failed";
     } finally {
       busy = false;
+    }
+  }
+
+  async function handleSyncNow(): Promise<void> {
+    errorMsg = null;
+    busy = true;
+    try {
+      snapshot = await client.syncNow();
+    } catch (err) {
+      errorMsg = err instanceof Error ? err.message : "Sync failed";
+    } finally {
+      busy = false;
+    }
+  }
+
+  async function handleRefreshReserve(): Promise<void> {
+    errorMsg = null;
+    reserveBusy = true;
+    try {
+      await client.refreshReserve();
+      snapshot = await client.getSnapshot();
+    } catch (err) {
+      errorMsg = err instanceof Error ? err.message : "Reserve lookup failed";
+    } finally {
+      reserveBusy = false;
+    }
+  }
+
+  async function handleGrantNodePermission(originPattern: string): Promise<void> {
+    if (!onRequestOriginPermission) return;
+    const granted = await onRequestOriginPermission(originPattern);
+    if (granted) {
+      await refreshDiagnostics();
+      await handleSyncNow();
     }
   }
 
@@ -192,17 +241,9 @@
         onVerified={handleBackupVerified}
       />
     {:else if !snapshot.hasVault}
-      <WelcomeOnboarding
-        {client}
-        onCreated={handleCreated}
-        onRestored={handleRestored}
-      />
+      <WelcomeOnboarding {client} onCreated={handleCreated} onRestored={handleRestored} />
     {:else if snapshot.locked}
-      <UnlockScreen
-        {client}
-        onUnlocked={handleUnlocked}
-        onReset={handleVaultReset}
-      />
+      <UnlockScreen {client} onUnlocked={handleUnlocked} onReset={handleVaultReset} />
     {:else if snapshot.activeWallet}
       <div class="lt-stack lt-screen-only" data-testid="wallet-unlocked">
         {#if snapshot.activeWallet.viewOnly}
@@ -210,6 +251,14 @@
             View-only wallet — incoming outputs only; cannot sign or spend.
           </div>
         {/if}
+
+        <SyncStatusBar
+          sync={snapshot.sync}
+          {busy}
+          onSyncNow={handleSyncNow}
+          onOpenNodeSettings={() => (activeTab = "security")}
+          {...(onRequestOriginPermission ? { onGrantPermission: handleGrantNodePermission } : {})}
+        />
 
         <div class="lt-tabs">
           <div class="lt-tablist" role="tablist" aria-label="Wallet sections">
@@ -227,16 +276,42 @@
               type="button"
               role="tab"
               class="lt-tab"
+              aria-selected={activeTab === "receive"}
+              onclick={() => (activeTab = "receive")}
+              data-testid="tab-receive"
+            >
+              Receive
+            </button>
+            <button
+              type="button"
+              role="tab"
+              class="lt-tab"
+              aria-selected={activeTab === "history"}
+              onclick={() => (activeTab = "history")}
+              data-testid="tab-history"
+            >
+              History
+            </button>
+            <button
+              type="button"
+              role="tab"
+              class="lt-tab"
               aria-selected={activeTab === "security"}
               onclick={() => (activeTab = "security")}
               data-testid="tab-security"
             >
-              Security &amp; settings
+              Settings
             </button>
           </div>
 
           {#if activeTab === "overview"}
             <div class="lt-tabpanel lt-stack" role="tabpanel">
+              <ReserveBanner
+                reserve={snapshot.reserve}
+                busy={reserveBusy}
+                onRefresh={handleRefreshReserve}
+              />
+
               <section class="lt-panel lt-stack">
                 <div class="lt-panel-header">
                   <div>
@@ -265,25 +340,43 @@
                   </div>
                 </div>
 
-                <AddressChunks address={snapshot.activeWallet.primaryAddress} />
-
-                <div class="lt-balance-secondary-grid">
+                <div class="lt-balance-secondary-grid" data-testid="asset-balance-grid">
                   {#each snapshot.balances as bal (bal.asset)}
-                    {@const parts = formatAtomicParts(BigInt(bal.unlocked), 4)}
-                    <div class="lt-balance-card">
+                    {@const unlockedP = formatAtomicParts(BigInt(bal.unlocked), 4)}
+                    {@const lockedP = formatAtomicParts(BigInt(bal.locked), 4)}
+                    {@const totalP = formatAtomicParts(BigInt(bal.total), 4)}
+                    <div class="lt-balance-card" data-testid={`balance-card-${bal.asset}`}>
                       <div class="lt-balance-label">
                         <AssetBadge asset={bal.asset} />
                         <span>Unlocked</span>
                       </div>
                       <div class="lt-amount lt-amount-lg">
-                        {parts.whole}.{parts.fracPrimary}<span class="lt-amount-tail"
-                          >{parts.fracTail}</span
+                        {unlockedP.whole}.{unlockedP.fracPrimary}<span class="lt-amount-tail"
+                          >{unlockedP.fracTail}</span
                         ><span class="lt-amount-ticker">{bal.asset}</span>
+                      </div>
+                      <div class="lt-balance-breakdown">
+                        <span>Locked: {lockedP.whole}.{lockedP.fracPrimary}</span>
+                        <span>Total: {totalP.whole}.{totalP.fracPrimary}</span>
                       </div>
                     </div>
                   {/each}
                 </div>
+
+                <AddressChunks address={snapshot.activeWallet.primaryAddress} />
               </section>
+            </div>
+          {:else if activeTab === "receive"}
+            <div class="lt-tabpanel" role="tabpanel">
+              <ReceiveView {client} />
+            </div>
+          {:else if activeTab === "history"}
+            <div class="lt-tabpanel" role="tabpanel">
+              <HistoryView
+                {client}
+                walletHeight={snapshot.sync.walletHeight}
+                viewOnly={snapshot.activeWallet.viewOnly}
+              />
             </div>
           {:else}
             <div class="lt-tabpanel" role="tabpanel">
@@ -293,7 +386,9 @@
                 walletName={snapshot.activeWallet.name}
                 viewOnly={snapshot.activeWallet.viewOnly}
                 onPrefsUpdated={handlePrefsUpdated}
+                onNodeSwitched={(nextSnap) => (snapshot = nextSnap)}
                 onVaultReset={handleVaultReset}
+                {...(onRequestOriginPermission ? { onRequestOriginPermission } : {})}
               />
             </div>
           {/if}

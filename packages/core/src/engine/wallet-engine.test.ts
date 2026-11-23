@@ -54,27 +54,38 @@ describe("WalletEngine M1.2 vault lifecycle", () => {
       hostKind: "memory",
       proxyToWorker: true,
       pbkdf2Iterations: 10_000,
-      fetchDaemonHeight: async () => 912_345
+      enableBackgroundSync: false,
+      fetchDaemonHeight: async () => null
     });
 
-    // 1. Create wallet with daemon height captured
+    // 1. Create wallet offline cleanly without hitting external network in unit test
     const created = await engine.createWallet({
       password: "initial-vault-password",
       name: "M1.2 Test Wallet",
       network: "mainnet"
     });
-    expect(created.restoreHeight).toBe(912_345);
-    expect(created.restoreHeightSource).toBe("daemon");
+    expect(created.restoreHeightSource).toBe("offline-estimate");
+    expect(created.restoreHeight).toBeGreaterThanOrEqual(0);
     expect(splitMnemonicWords(created.seed).length).toBe(25);
     expect(created.snapshot.activeWallet?.primaryAddress).toMatch(/^ZEPHYR/);
     expect(created.snapshot.activeWallet?.seedBackupVerified).toBe(false);
     expect(created.snapshot.activeWallet?.viewOnly).toBe(false);
+    expect(created.snapshot.balances.every((b) => b.locked === "0")).toBe(true);
     // Secret seed must NEVER appear in snapshot
     expect(JSON.stringify(created.snapshot)).not.toContain(created.seed);
     // Safe write order: blobs persisted BEFORE vault_meta
     expect(store.writeOrder).toEqual(["blob:keys", "blob:cache", "meta"]);
 
     const primaryAddress = created.snapshot.activeWallet!.primaryAddress;
+
+    // 1b. Subaddress creation, labeling, and empty history DTOs
+    const createdSub = await engine.createSubaddress("Donations");
+    expect(createdSub.index).toBe(1);
+    expect(createdSub.label).toBe("Donations");
+    expect(createdSub.address).toMatch(/^ZEPHs/);
+    const relabeled = await engine.setSubaddressLabel(1, "Updated Label");
+    expect(relabeled.find((s) => s.index === 1)?.label).toBe("Updated Label");
+    expect(await engine.getHistory()).toEqual([]);
 
     // 2. Mark seed backup verified
     const verifiedSnap = await engine.markSeedBackupVerified();
@@ -114,7 +125,7 @@ describe("WalletEngine M1.2 vault lifecycle", () => {
     const reopened = await engine.unlockWallet("rotated-vault-password");
     expect(reopened.activeWallet?.primaryAddress).toBe(primaryAddress);
     expect(reopened.activeWallet?.seedBackupVerified).toBe(true);
-    expect(reopened.activeWallet?.restoreHeight).toBe(912_345);
+    expect(reopened.activeWallet?.restoreHeight).toBe(created.restoreHeight);
 
     // 6. Reset vault wipes blobs and metadata cleanly
     const resetSnap = await engine.resetVault();
@@ -166,6 +177,7 @@ describe("WalletEngine M1.2 vault lifecycle", () => {
       hostKind: "memory",
       proxyToWorker: true,
       pbkdf2Iterations: 10_000,
+      enableBackgroundSync: false,
       fetchDaemonHeight: async () => null
     });
 

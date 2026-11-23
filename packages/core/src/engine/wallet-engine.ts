@@ -7,16 +7,26 @@ import {
   setWasmModuleUrl,
   setWorkerDistPath,
   validateAddress,
-  type ZephyrWallet
+  type ZephyrHistoryQuery,
+  type ZephyrSubaddress,
+  type ZephyrWallet,
+  type ZephyrWalletTx
 } from "@loki-notfound/zephyr-ts";
 import { V2_ASSET_CODES } from "../assets/index.js";
+import { DEFAULT_PUBLIC_NODE_URL, validateNodeUrl } from "../network/node-url.js";
+import { ReserveService } from "../network/reserve.js";
 import type {
   BalanceEntryDto,
   CreateWalletResultDto,
   HostKind,
+  NodeProbeResultDto,
+  ProofKind,
+  ReserveStatusDto,
   RevealedSecretsDto,
+  SubaddressDto,
   WalletSnapshot,
   WalletSummaryDto,
+  WalletTxDto,
   ZephyrNetwork
 } from "../rpc/protocol.js";
 import type { VaultBlobStore } from "../storage/types.js";
@@ -44,9 +54,10 @@ import {
   type VaultManifestPlaintext,
   type WalletManifestEntry
 } from "../vault/types.js";
+import { DEFAULT_SYNC_INTERVAL_MS, SyncController } from "./sync-controller.js";
 
-const DEFAULT_PUBLIC_NODE_URL = "https://node.lateo.dev";
 const DEFAULT_HEIGHT_FETCH_TIMEOUT_MS = 4_000;
+const NODE_PROBE_TIMEOUT_MS = 6_000;
 const HEX_64_RE = /^[0-9a-f]{64}$/i;
 
 export interface WalletEngineOptions {
@@ -55,15 +66,15 @@ export interface WalletEngineOptions {
   readonly proxyToWorker?: boolean;
   readonly pbkdf2Iterations?: number;
   readonly defaultNodeUrl?: string;
+  readonly syncIntervalMs?: number;
+  readonly enableBackgroundSync?: boolean;
   readonly heightFetchTimeoutMs?: number;
-  /**
-   * Optional override for capturing the live daemon height during Create Wallet.
-   * Returns a non-negative integer height or null if offline/unavailable.
-   */
+  readonly checkOriginPermission?: (originPattern: string) => Promise<boolean>;
   readonly fetchDaemonHeight?: (network: ZephyrNetwork) => Promise<number | null>;
   readonly wasmModuleUrl?: string;
   readonly workerDistPath?: string;
   readonly onSnapshot?: (snapshot: WalletSnapshot) => void;
+  readonly onSyncBusyChange?: (busy: boolean) => void;
 }
 
 function assertValidPassword(password: string, label = "Vault password"): void {
@@ -82,20 +93,90 @@ async function fetchHeightFromDaemon(
   nodeUrl: string,
   timeoutMs: number
 ): Promise<number | null> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
   try {
     const rpc = new ZephyrDaemonRpc(nodeUrl);
-    const heightPromise = rpc.getHeight();
-    const timeoutPromise = new Promise<null>((resolve) =>
-      setTimeout(() => resolve(null), timeoutMs)
-    );
-    const result = await Promise.race([heightPromise, timeoutPromise]);
+    const timeoutPromise = new Promise<null>((resolve) => {
+      timer = setTimeout(() => resolve(null), timeoutMs);
+    });
+    const result = await Promise.race([rpc.getHeight(), timeoutPromise]);
     if (typeof result === "number" && Number.isSafeInteger(result) && result >= 0) {
       return result;
     }
     return null;
   } catch {
     return null;
+  } finally {
+    if (timer !== undefined) {
+      clearTimeout(timer);
+    }
   }
+}
+
+function networkFromCode(code: 0 | 1 | 2 | undefined): ZephyrNetwork | null {
+  if (code === 0) return "mainnet";
+  if (code === 1) return "testnet";
+  if (code === 2) return "stagenet";
+  return null;
+}
+
+function mapSubaddress(sub: ZephyrSubaddress): SubaddressDto {
+  return {
+    accountIndex: sub.accountIndex,
+    index: sub.index,
+    address: sub.address,
+    label: sub.label,
+    isUsed: sub.isUsed,
+    numUnspentOutputs: sub.numUnspentOutputs
+  };
+}
+
+function mapTx(tx: ZephyrWalletTx): WalletTxDto {
+  return {
+    hash: tx.hash,
+    height: tx.height ?? null,
+    timestamp: tx.timestamp ?? null,
+    confirmations: tx.confirmations,
+    isConfirmed: tx.isConfirmed,
+    inPool: tx.inPool,
+    isFailed: tx.isFailed,
+    isLocked: tx.isLocked,
+    isMinerTx: tx.isMinerTx,
+    fee: tx.fee !== undefined ? tx.fee.toString() : null,
+    feeAsset: tx.feeAsset ?? null,
+    incomingTransfers: tx.incomingTransfers.map((t) => ({
+      direction: t.direction,
+      asset: t.asset ?? null,
+      amount: t.amount.toString(),
+      accountIndex: t.accountIndex,
+      ...(t.subaddressIndex !== undefined ? { subaddressIndex: t.subaddressIndex } : {})
+    })),
+    outgoingTransfer: tx.outgoingTransfer
+      ? {
+          direction: tx.outgoingTransfer.direction,
+          asset: tx.outgoingTransfer.asset ?? null,
+          amount: tx.outgoingTransfer.amount.toString(),
+          accountIndex: tx.outgoingTransfer.accountIndex,
+          ...(tx.outgoingTransfer.destinations
+            ? {
+                destinations: tx.outgoingTransfer.destinations.map((d) => ({
+                  ...(d.address !== undefined ? { address: d.address } : {}),
+                  amount: d.amount.toString(),
+                  ...(d.asset !== undefined ? { asset: d.asset } : {})
+                }))
+              }
+            : {})
+        }
+      : null,
+    conversion: tx.conversion
+      ? {
+          sourceAsset: tx.conversion.sourceAsset,
+          destinationAsset: tx.conversion.destinationAsset,
+          sourceAmount: tx.conversion.sourceAmount.toString(),
+          destinationAmount: tx.conversion.destinationAmount.toString()
+        }
+      : null
+  };
 }
 
 export class WalletEngine {
@@ -103,11 +184,18 @@ export class WalletEngine {
   private readonly hostKind: HostKind;
   private readonly proxyToWorker: boolean;
   private readonly pbkdf2Iterations: number;
-  private readonly defaultNodeUrl: string;
   private readonly heightFetchTimeoutMs: number;
+  private readonly enableBackgroundSync: boolean;
+  private readonly checkOriginPermission:
+    | ((originPattern: string) => Promise<boolean>)
+    | undefined;
   private readonly fetchDaemonHeightFn: (network: ZephyrNetwork) => Promise<number | null>;
   private readonly onSnapshot: ((snapshot: WalletSnapshot) => void) | undefined;
 
+  private readonly syncController: SyncController;
+  private readonly reserveService = new ReserveService();
+
+  private activeNodeUrl: string;
   private queue: Promise<unknown> = Promise.resolve();
   private activeWallet: ZephyrWallet | null = null;
   private activeManifest: VaultManifestPlaintext | null = null;
@@ -124,15 +212,47 @@ export class WalletEngine {
     this.hostKind = options.hostKind;
     this.proxyToWorker = options.proxyToWorker ?? true;
     this.pbkdf2Iterations = options.pbkdf2Iterations ?? DEFAULT_PBKDF2_ITERATIONS;
-    this.defaultNodeUrl = options.defaultNodeUrl ?? DEFAULT_PUBLIC_NODE_URL;
+    this.activeNodeUrl = validateNodeUrl(options.defaultNodeUrl ?? DEFAULT_PUBLIC_NODE_URL).url;
     this.heightFetchTimeoutMs = options.heightFetchTimeoutMs ?? DEFAULT_HEIGHT_FETCH_TIMEOUT_MS;
+    this.enableBackgroundSync = options.enableBackgroundSync ?? true;
+    this.checkOriginPermission = options.checkOriginPermission;
     this.fetchDaemonHeightFn =
       options.fetchDaemonHeight ??
       ((network) =>
         network === "mainnet"
-          ? fetchHeightFromDaemon(this.defaultNodeUrl, this.heightFetchTimeoutMs)
+          ? fetchHeightFromDaemon(this.activeNodeUrl, this.heightFetchTimeoutMs)
           : Promise.resolve(null));
     this.onSnapshot = options.onSnapshot;
+
+    this.syncController = new SyncController({
+      nodeUrl: this.activeNodeUrl,
+      intervalMs: options.syncIntervalMs ?? DEFAULT_SYNC_INTERVAL_MS,
+      ...(options.checkOriginPermission
+        ? { checkOriginPermission: options.checkOriginPermission }
+        : {}),
+      onStatusChange: () => {
+        void this.emitSnapshot();
+      },
+      ...(options.onSyncBusyChange ? { onBusyChange: options.onSyncBusyChange } : {}),
+      onCheckpointRequired: async () => {
+        if (this.activeWallet && this.activeEntry && this.dekKey) {
+          await this.persistActiveWalletBlobs(this.activeWallet, this.activeEntry.id, this.dekKey);
+        }
+      },
+      onSyncCompleted: async () => {
+        if (this.activeWallet) {
+          this.cachedBalances = await this.readBalances(this.activeWallet);
+          try {
+            await this.reserveService.refreshFromWalletAndNode(
+              this.activeWallet,
+              this.activeNodeUrl
+            );
+          } catch {
+            // Reserve banner remains at last known good reading on transient failure
+          }
+        }
+      }
+    });
 
     if (options.workerDistPath) {
       setWorkerDistPath(options.workerDistPath);
@@ -179,6 +299,8 @@ export class WalletEngine {
       savingState: this.savingState,
       activeWallet: activeSummary,
       balances: this.cachedBalances,
+      sync: this.syncController.getStatus(),
+      reserve: this.reserveService.getCached(),
       lastPersistedAt: this.lastPersistedAt,
       hostKind: this.hostKind
     };
@@ -191,11 +313,38 @@ export class WalletEngine {
   private async readBalances(wallet: ZephyrWallet): Promise<readonly BalanceEntryDto[]> {
     const totalMap = await wallet.getBalance();
     const unlockedMap = await wallet.getUnlockedBalance();
-    return V2_ASSET_CODES.map((asset) => ({
-      asset,
-      total: (totalMap.get(asset) ?? 0n).toString(),
-      unlocked: (unlockedMap.get(asset) ?? 0n).toString()
-    }));
+    return V2_ASSET_CODES.map((asset) => {
+      const total = totalMap.get(asset) ?? 0n;
+      const unlocked = unlockedMap.get(asset) ?? 0n;
+      const locked = total > unlocked ? total - unlocked : 0n;
+      return {
+        asset,
+        total: total.toString(),
+        unlocked: unlocked.toString(),
+        locked: locked.toString()
+      };
+    });
+  }
+
+  private attachSyncForActiveWallet(wallet: ZephyrWallet, initialHeight: number): void {
+    this.syncController.attach(
+      {
+        setDaemonConnection: (url) => wallet.setDaemonConnection(url),
+        getHeight: () => wallet.getHeight(),
+        getDaemonHeight: () => wallet.getDaemonHeight(),
+        sync: (onProgress) =>
+          wallet.sync({
+            onSyncProgress: (height, startHeight, endHeight, percentDone) => {
+              onProgress(height, startHeight, endHeight, percentDone);
+            }
+          })
+      },
+      initialHeight,
+      this.lastPersistedAt
+    );
+    if (this.enableBackgroundSync) {
+      this.syncController.startBackgroundLoop();
+    }
   }
 
   private async encryptActiveWalletBlobs(
@@ -219,11 +368,6 @@ export class WalletEngine {
     }
   }
 
-  /**
-   * Commit initial vault creation/restore safely: either via a single multi-store
-   * atomic IndexedDB transaction or by writing blobs BEFORE vault_meta so a crash
-   * never leaves an orphaned vault_meta referencing missing blobs.
-   */
   private async commitNewVault(
     wallet: ZephyrWallet,
     walletId: string,
@@ -278,14 +422,17 @@ export class WalletEngine {
       const walletId = generateWalletId();
       const { dekKey, dekBase64 } = await generateDek();
 
-      const [wallet, daemonHeight] = await Promise.all([
-        createRandomWallet({
-          networkType: network,
-          password: corePassword,
-          proxyToWorker: this.proxyToWorker
-        }),
-        this.fetchDaemonHeightFn(network)
-      ]);
+      // Probe daemon height first with a short timeout; pass server to createRandomWallet
+      // when reachable so the WASM keys blob natively captures the live daemon restoreHeight.
+      const daemonHeight = await this.fetchDaemonHeightFn(network);
+      const canPassServer = daemonHeight !== null && network === "mainnet";
+
+      const wallet = await createRandomWallet({
+        networkType: network,
+        password: corePassword,
+        proxyToWorker: this.proxyToWorker,
+        ...(canPassServer ? { server: this.activeNodeUrl } : {})
+      });
 
       try {
         const primaryAddress = await wallet.getPrimaryAddress();
@@ -293,8 +440,9 @@ export class WalletEngine {
         if (!seed) {
           throw new Error("Created wallet did not return a recovery seed");
         }
-        const coreEstimateHeight = await wallet.getRestoreHeight();
-        const restoreHeight = daemonHeight !== null ? daemonHeight : coreEstimateHeight;
+        const coreHeight = await wallet.getRestoreHeight();
+        const restoreHeight =
+          daemonHeight !== null ? Math.max(daemonHeight, coreHeight) : coreHeight;
         const restoreHeightSource: RestoreHeightSource =
           daemonHeight !== null ? "daemon" : "offline-estimate";
         const createdAt = new Date().toISOString();
@@ -329,6 +477,7 @@ export class WalletEngine {
         this.kdf = kdf;
         this.dekKey = dekKey;
         this.cachedBalances = await this.readBalances(wallet);
+        this.attachSyncForActiveWallet(wallet, await wallet.getHeight());
         const snapshot = await this.emitSnapshot();
 
         return {
@@ -414,6 +563,7 @@ export class WalletEngine {
         this.kdf = kdf;
         this.dekKey = dekKey;
         this.cachedBalances = await this.readBalances(wallet);
+        this.attachSyncForActiveWallet(wallet, await wallet.getHeight());
         return await this.emitSnapshot();
       } catch (err) {
         await this.safeCloseOrTerminate(wallet);
@@ -507,6 +657,7 @@ export class WalletEngine {
         this.kdf = kdf;
         this.dekKey = dekKey;
         this.cachedBalances = await this.readBalances(wallet);
+        this.attachSyncForActiveWallet(wallet, await wallet.getHeight());
         return await this.emitSnapshot();
       } catch (err) {
         await this.safeCloseOrTerminate(wallet);
@@ -602,6 +753,11 @@ export class WalletEngine {
         this.dekKey = dekKey;
         this.lastPersistedAt = encCache?.updatedAt ?? encKeys.updatedAt;
         this.cachedBalances = await this.readBalances(wallet);
+        const restoredWalletHeight = Math.max(
+          await wallet.getHeight(),
+          encCache?.syncedHeight ?? 0
+        );
+        this.attachSyncForActiveWallet(wallet, restoredWalletHeight);
         return await this.emitSnapshot();
       } finally {
         zeroize(keysData);
@@ -628,10 +784,7 @@ export class WalletEngine {
         throw new Error("No vault found");
       }
 
-      // Cryptographically verify current password against persisted vault_meta
       const { manifest } = await decryptVaultMeta(existingMeta, params.currentPassword);
-
-      // Re-wrap the existing DEK + manifest under fresh salt, fresh IV, and 600k PBKDF2
       const { record, kek, kdf } = await encryptVaultMeta(manifest, params.newPassword, {
         iterations: this.pbkdf2Iterations
       });
@@ -652,7 +805,6 @@ export class WalletEngine {
       if (!existingMeta) {
         throw new Error("No vault found");
       }
-      // Verify vault password on every reveal call
       await decryptVaultMeta(existingMeta, password);
 
       const primaryAddress = await this.activeWallet.getPrimaryAddress();
@@ -674,6 +826,219 @@ export class WalletEngine {
     });
   }
 
+  async syncNow(): Promise<WalletSnapshot> {
+    return this.enqueue(async () => {
+      if (!this.activeWallet) {
+        return await this.buildSnapshot();
+      }
+      await this.syncController.syncOnce();
+      return await this.emitSnapshot();
+    });
+  }
+
+  async refreshReserve(): Promise<ReserveStatusDto | null> {
+    return this.enqueue(async () => {
+      if (!this.activeWallet) return null;
+      const validated = validateNodeUrl(this.activeNodeUrl);
+      if (this.checkOriginPermission) {
+        const granted = await this.checkOriginPermission(validated.originPattern);
+        if (!granted) return this.reserveService.getCached();
+      }
+      await this.activeWallet.setDaemonConnection(this.activeNodeUrl);
+      const status = await this.reserveService.refreshFromWalletAndNode(
+        this.activeWallet,
+        this.activeNodeUrl
+      );
+      await this.emitSnapshot();
+      return status;
+    });
+  }
+
+  async probeNode(rawUrl: string): Promise<NodeProbeResultDto> {
+    const validated = validateNodeUrl(rawUrl);
+    if (this.checkOriginPermission) {
+      const granted = await this.checkOriginPermission(validated.originPattern);
+      if (!granted) {
+        return {
+          url: validated.url,
+          host: validated.host,
+          originPattern: validated.originPattern,
+          isLocal: validated.isLocal,
+          reachable: false,
+          height: null,
+          isSynchronized: null,
+          network: null,
+          version: null,
+          permissionRequired: true,
+          errorMessage: `Browser host permission required for ${validated.originPattern}`
+        };
+      }
+    }
+
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const rpc = new ZephyrDaemonRpc(validated.url);
+      const timeoutPromise = new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new Error("Connection probe timed out")), NODE_PROBE_TIMEOUT_MS);
+      });
+      const [info, height] = await Promise.race([
+        Promise.all([rpc.getInfo(), rpc.getHeight()]),
+        timeoutPromise
+      ]);
+      return {
+        url: validated.url,
+        host: validated.host,
+        originPattern: validated.originPattern,
+        isLocal: validated.isLocal,
+        reachable: true,
+        height,
+        isSynchronized: info.isSynchronized ?? null,
+        network: networkFromCode(info.networkType),
+        version: info.version && info.version.length > 0 ? info.version : null,
+        permissionRequired: false,
+        errorMessage: null
+      };
+    } catch (err) {
+      return {
+        url: validated.url,
+        host: validated.host,
+        originPattern: validated.originPattern,
+        isLocal: validated.isLocal,
+        reachable: false,
+        height: null,
+        isSynchronized: null,
+        network: null,
+        version: null,
+        permissionRequired: false,
+        errorMessage:
+          err instanceof Error && err.message.includes("timed out")
+            ? "Node probe timed out"
+            : `Could not reach ${validated.host}`
+      };
+    } finally {
+      if (timer !== undefined) {
+        clearTimeout(timer);
+      }
+    }
+  }
+
+  async setActiveNode(rawUrl: string): Promise<WalletSnapshot> {
+    return this.enqueue(async () => {
+      const validated = validateNodeUrl(rawUrl);
+      this.activeNodeUrl = validated.url;
+      this.syncController.setNodeUrl(validated.url);
+      this.reserveService.resetForNodeSwitch();
+      if (this.activeWallet) {
+        await this.activeWallet.setDaemonConnection(validated.url);
+        await this.syncController.syncOnce();
+      }
+      return await this.emitSnapshot();
+    });
+  }
+
+  async listSubaddresses(): Promise<readonly SubaddressDto[]> {
+    return this.enqueue(async () => {
+      if (!this.activeWallet) {
+        throw new Error("Wallet must be unlocked");
+      }
+      const list = await this.activeWallet.getSubaddresses(0);
+      return list.map(mapSubaddress);
+    });
+  }
+
+  async createSubaddress(label?: string): Promise<SubaddressDto> {
+    return this.enqueue(async () => {
+      if (!this.activeWallet || !this.activeEntry || !this.dekKey) {
+        throw new Error("Wallet must be unlocked");
+      }
+      const cleanLabel = (label ?? "").trim().slice(0, 120);
+      const sub = await this.activeWallet.createSubaddress(0, cleanLabel);
+      await this.persistActiveWalletBlobs(this.activeWallet, this.activeEntry.id, this.dekKey);
+      await this.emitSnapshot();
+      return mapSubaddress(sub);
+    });
+  }
+
+  async setSubaddressLabel(index: number, label: string): Promise<readonly SubaddressDto[]> {
+    return this.enqueue(async () => {
+      if (!this.activeWallet || !this.activeEntry || !this.dekKey) {
+        throw new Error("Wallet must be unlocked");
+      }
+      const cleanLabel = label.trim().slice(0, 120);
+      await this.activeWallet.setSubaddressLabel(0, index, cleanLabel);
+      await this.persistActiveWalletBlobs(this.activeWallet, this.activeEntry.id, this.dekKey);
+      const list = await this.activeWallet.getSubaddresses(0);
+      await this.emitSnapshot();
+      return list.map(mapSubaddress);
+    });
+  }
+
+  async getHistory(filter?: {
+    readonly asset?: string;
+    readonly direction?: "incoming" | "outgoing";
+  }): Promise<readonly WalletTxDto[]> {
+    return this.enqueue(async () => {
+      if (!this.activeWallet) {
+        throw new Error("Wallet must be unlocked");
+      }
+      const query: ZephyrHistoryQuery = {
+        ...(filter?.asset ? { asset: filter.asset } : {}),
+        ...(filter?.direction ? { direction: filter.direction } : {})
+      };
+      const txs = await this.activeWallet.getTxs(
+        Object.keys(query).length > 0 ? query : undefined
+      );
+      return txs.map(mapTx).reverse();
+    });
+  }
+
+  async refreshPool(): Promise<{
+    readonly poolCount: number;
+    readonly txs: readonly WalletTxDto[];
+  }> {
+    return this.enqueue(async () => {
+      if (!this.activeWallet) {
+        throw new Error("Wallet must be unlocked");
+      }
+      const validated = validateNodeUrl(this.activeNodeUrl);
+      if (this.checkOriginPermission) {
+        const granted = await this.checkOriginPermission(validated.originPattern);
+        if (!granted) {
+          throw new Error(`Host permission required for ${validated.host}`);
+        }
+      }
+      await this.activeWallet.setDaemonConnection(this.activeNodeUrl);
+      const poolCount = await this.activeWallet.refreshPool();
+      const txs = (await this.activeWallet.getTxs()).map(mapTx).reverse();
+      return { poolCount, txs };
+    });
+  }
+
+  async exportTxProof(params: {
+    readonly kind: ProofKind;
+    readonly txHash: string;
+    readonly address?: string;
+    readonly message?: string;
+  }): Promise<string> {
+    return this.enqueue(async () => {
+      if (!this.activeWallet) {
+        throw new Error("Wallet must be unlocked");
+      }
+      if (params.kind === "tx_key") {
+        return this.activeWallet.getTxKey(params.txHash);
+      }
+      if (params.kind === "spend_proof") {
+        await this.activeWallet.setDaemonConnection(this.activeNodeUrl);
+        return this.activeWallet.getSpendProof(params.txHash, params.message);
+      }
+      if (!params.address) {
+        throw new Error("Recipient or wallet address is required for a transaction proof");
+      }
+      await this.activeWallet.setDaemonConnection(this.activeNodeUrl);
+      return this.activeWallet.getTxProof(params.txHash, params.address, params.message);
+    });
+  }
+
   async lockWallet(): Promise<WalletSnapshot> {
     return this.enqueue(async () => {
       await this.closeActiveWalletInternal(true);
@@ -691,6 +1056,9 @@ export class WalletEngine {
   }
 
   private async closeActiveWalletInternal(persistBeforeClose: boolean): Promise<void> {
+    this.syncController.stop();
+    this.reserveService.resetForNodeSwitch();
+
     const wallet = this.activeWallet;
     const entry = this.activeEntry;
     const dekKey = this.dekKey;
@@ -726,7 +1094,7 @@ export class WalletEngine {
     const outcome = await Promise.race([closed, timeout]);
     if (outcome !== "closed" && wallet.proxied) {
       try {
-        wallet.terminate();
+        await wallet.terminate();
       } catch {
         // Best-effort worker termination
       }

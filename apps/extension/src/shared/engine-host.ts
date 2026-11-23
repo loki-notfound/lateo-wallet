@@ -10,6 +10,8 @@ import { IndexedDbVaultStore } from "./idb-store.js";
 
 export interface ExtensionEngineHostOptions {
   readonly hostKind: HostKind;
+  readonly defaultNodeUrl?: string;
+  readonly checkOriginPermission?: (originPattern: string) => Promise<boolean>;
   readonly onSnapshot?: (snapshot: WalletSnapshot) => void;
   readonly onBusyChange?: (busy: boolean) => void;
 }
@@ -18,6 +20,7 @@ export class ExtensionEngineHost {
   private readonly engine: WalletEngine;
   private readonly onBusyChange: ((busy: boolean) => void) | undefined;
   private activeOps = 0;
+  private syncBusy = false;
 
   constructor(options: ExtensionEngineHostOptions) {
     this.onBusyChange = options.onBusyChange;
@@ -26,22 +29,34 @@ export class ExtensionEngineHost {
       store,
       hostKind: options.hostKind,
       proxyToWorker: true,
-      ...(options.onSnapshot ? { onSnapshot: options.onSnapshot } : {})
+      ...(options.defaultNodeUrl ? { defaultNodeUrl: options.defaultNodeUrl } : {}),
+      ...(options.checkOriginPermission
+        ? { checkOriginPermission: options.checkOriginPermission }
+        : {}),
+      ...(options.onSnapshot ? { onSnapshot: options.onSnapshot } : {}),
+      onSyncBusyChange: (busy) => {
+        this.syncBusy = busy;
+        this.emitBusy();
+      }
     });
   }
 
   isBusy(): boolean {
-    return this.activeOps > 0;
+    return this.activeOps > 0 || this.syncBusy;
+  }
+
+  private emitBusy(): void {
+    this.onBusyChange?.(this.isBusy());
   }
 
   private async trackOp<T>(fn: () => Promise<T>): Promise<T> {
     this.activeOps++;
-    if (this.activeOps === 1) this.onBusyChange?.(true);
+    if (this.activeOps === 1) this.emitBusy();
     try {
       return await fn();
     } finally {
       this.activeOps = Math.max(0, this.activeOps - 1);
-      if (this.activeOps === 0) this.onBusyChange?.(false);
+      this.emitBusy();
     }
   }
 
@@ -114,6 +129,60 @@ export class ExtensionEngineHost {
         }
         case "RESET_VAULT": {
           const result = await this.trackOp(() => this.engine.resetVault());
+          return { id: req.id, ok: true, result };
+        }
+        case "SYNC_NOW": {
+          const result = await this.trackOp(() => this.engine.syncNow());
+          return { id: req.id, ok: true, result };
+        }
+        case "REFRESH_RESERVE": {
+          const result = await this.trackOp(() => this.engine.refreshReserve());
+          return { id: req.id, ok: true, result };
+        }
+        case "PROBE_NODE": {
+          const result = await this.trackOp(() => this.engine.probeNode(req.url));
+          return { id: req.id, ok: true, result };
+        }
+        case "SWITCH_NODE": {
+          const result = await this.trackOp(() => this.engine.setActiveNode(req.url));
+          return { id: req.id, ok: true, result };
+        }
+        case "LIST_SUBADDRESSES": {
+          const result = await this.trackOp(() => this.engine.listSubaddresses());
+          return { id: req.id, ok: true, result };
+        }
+        case "CREATE_SUBADDRESS": {
+          const result = await this.trackOp(() => this.engine.createSubaddress(req.label));
+          return { id: req.id, ok: true, result };
+        }
+        case "SET_SUBADDRESS_LABEL": {
+          const result = await this.trackOp(() =>
+            this.engine.setSubaddressLabel(req.index, req.label)
+          );
+          return { id: req.id, ok: true, result };
+        }
+        case "GET_HISTORY": {
+          const result = await this.trackOp(() =>
+            this.engine.getHistory({
+              ...(req.asset ? { asset: req.asset } : {}),
+              ...(req.direction ? { direction: req.direction } : {})
+            })
+          );
+          return { id: req.id, ok: true, result };
+        }
+        case "REFRESH_POOL": {
+          const result = await this.trackOp(() => this.engine.refreshPool());
+          return { id: req.id, ok: true, result };
+        }
+        case "EXPORT_TX_PROOF": {
+          const result = await this.trackOp(() =>
+            this.engine.exportTxProof({
+              kind: req.kind,
+              txHash: req.txHash,
+              ...(req.address ? { address: req.address } : {}),
+              ...(req.message !== undefined ? { message: req.message } : {})
+            })
+          );
           return { id: req.id, ok: true, result };
         }
         case "GET_DIAGNOSTICS":

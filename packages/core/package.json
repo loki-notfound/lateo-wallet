@@ -6,6 +6,9 @@
   "exports": {
     ".": "./src/index.ts",
     "./assets": "./src/assets/index.ts",
+    "./network": "./src/network/index.ts",
+    "./node-url": "./src/network/node-url.ts",
+    "./qr": "./src/qr/index.ts",
     "./rpc": "./src/rpc/protocol.ts",
     "./storage": "./src/storage/types.ts",
     "./vault": "./src/vault/index.ts"
@@ -14,6 +17,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@loki-notfound/zephyr-ts": "https://github.com/loki-notfound/myzephyr-ts/releases/download/v2.3.0-sec.2-ts.2/loki-notfound-zephyr-ts-2.3.0-sec.2-ts.2.tgz"
+    "@loki-notfound/zephyr-ts": "https://github.com/loki-notfound/myzephyr-ts/releases/download/v2.3.0-sec.2-ts.2/loki-notfound-zephyr-ts-2.3.0-sec.2-ts.2.tgz",
+    "uqr": "^0.1.2"
   }
 }
